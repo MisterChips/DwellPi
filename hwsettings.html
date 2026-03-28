@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DwellPi - Water Settings</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="page" id="dwellpi-hwsettings-page">
+
+        <header class="page-header">
+            <a href="/" class="header-btn left">Home</a>
+            <div class="header-title">
+                <h1>DwellPi</h1>
+                <div>Water Settings</div>
+            </div>
+            <a href="/web/chsettings.html" class="header-btn right">Heating<br>Settings</a>
+        </header>
+
+        <main class="page-content">
+            <div class="settings-stack">
+
+                <section class="panel">
+                    <div class="panel-title-row">
+                        <span>Water</span>
+                        <span class="demand-status" id="water-demand-status">--</span>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Boost</div>
+                    <div class="panel-body">
+                        <input type="text" id="ip-hwsettings-water-boost" class="boost-readout" readonly value="00:00">
+                        <div class="button-row button-row-two button-row-large">
+                            <button type="button" id="bt-hwsettings-water-boost-plus" class="large-btn">1 Hour</button>
+                            <button type="button" id="bt-hwsettings-water-boost-clear" class="large-btn">Clear</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">System Function</div>
+                    <div class="panel-body">
+                        <select id="sel-hwsettings-water-switch" class="large-select">
+                            <option value="timed">Timed</option>
+                            <option value="on">On</option>
+                            <option value="off">Off</option>
+                            <option value="once">Once</option>
+                        </select>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-body">
+                        <button type="button" class="advance-btn advance-btn-large" id="bt-hwsettings-water-advance">Advance</button>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Water programs status</div>
+                    <div class="panel-body">
+                        <div class="status-body" id="water-programs-status">--</div>
+                    </div>
+                </section>
+
+            </div>
+        </main>
+
+        <footer class="page-footer">
+            <div class="footer-nav">
+                <a href="/web/hwprogs.html">Water Programs</a>
+                <a href="/web/syssettings.html">System Settings</a>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/common.js"></script>
+    <script src="/static/hwsettings.js"></script>
+</body>
+</html>
