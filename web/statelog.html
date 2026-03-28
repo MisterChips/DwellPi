@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DwellPi - State Log</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="page" id="dwellpi-statelog-page">
+
+        <header class="page-header">
+            <a href="/web/syssettings.html" class="header-btn left">System<br>Settings</a>
+            <div class="header-title">
+                <h1>DwellPi</h1>
+                <div>State Log</div>
+            </div>
+            <a href="/" class="header-btn right">Home</a>
+        </header>
+
+        <main class="page-content">
+            <section class="panel">
+                <div class="panel-title-row">
+                    <span>Filter</span>
+                    <button id="bt-statelog-refresh" class="small-action-btn">Refresh</button>
+                </div>
+                <div class="panel-body">
+                    <div class="form-row">
+                        <label for="statelog-date">Date</label>
+                        <input type="date" id="statelog-date">
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-title">Entries</div>
+                <div class="panel-body">
+                    <div class="programs-table-wrap">
+                        <table class="programs-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>System</th>
+                                    <th>State</th>
+                                </tr>
+                            </thead>
+                            <tbody id="statelog-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <section class="system-section">
+                <div class="system-line" id="statelog-status-line">State log page ready.</div>
+            </section>
+        </main>
+
+        <footer class="page-footer">
+            <div class="footer-nav">
+                <a href="/web/templog.html">Temperature Log</a>
+                <a href="/web/syssettings.html">System Settings</a>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/common.js"></script>
+    <script src="/static/statelog.js"></script>
+</body>
+</html>

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DwellPi - Heating Settings</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="page" id="dwellpi-chsettings-page">
+
+        <header class="page-header">
+            <a href="/" class="header-btn left">Home</a>
+            <div class="header-title">
+                <h1>DwellPi</h1>
+                <div>Heating Settings</div>
+            </div>
+            <a href="/web/hwsettings.html" class="header-btn right">Water<br>Settings</a>
+        </header>
+
+        <main class="page-content">
+            <div class="settings-stack">
+
+                <section class="panel">
+                    <div class="panel-title-row">
+                        <span>Heat</span>
+                        <span class="demand-status" id="heat-demand-status">--</span>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Setpoint</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button class="stepper-btn" data-target="ip-chsettings-setpoint" data-step="-0.1">−</button>
+                            <input type="number" id="ip-chsettings-setpoint" class="stepper-input big-readout" step="0.1">
+                            <button class="stepper-btn" data-target="ip-chsettings-setpoint" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Boost</div>
+                    <div class="panel-body">
+                        <input type="text" id="ip-chsettings-heat-boost" class="boost-readout" readonly value="00:00">
+                        <div class="button-row button-row-two">
+                            <button type="button" id="bt-chsettings-heat-boost-plus">1 Hour</button>
+                            <button type="button" id="bt-chsettings-heat-boost-clear">Clear</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">System Function</div>
+                    <div class="panel-body">
+                        <select id="sel-chsettings-heat-switch">
+                            <option value="timed">Timed</option>
+                            <option value="on">On</option>
+                            <option value="off">Off</option>
+                            <option value="once">Once</option>
+                        </select>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-body">
+                        <button type="button" class="advance-btn advance-btn-large" id="bt-chsettings-heat-advance">Advance</button>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Heat programs status</div>
+                    <div class="panel-body">
+                        <div class="status-body" id="heat-programs-status">--</div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Boost Setpoint</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-boost-setpoint" data-step="-0.1">-</button>
+                            <input type="number" id="ip-chsettings-boost-setpoint" class="big-readout stepper-input" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-boost-setpoint" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Default On Setpoint</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-default-on-setpoint" data-step="-0.1">-</button>
+                            <input type="number" id="ip-chsettings-default-on-setpoint" class="big-readout stepper-input" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-default-on-setpoint" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Default Setpoint</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-default-setpoint" data-step="-0.1">-</button>
+                            <input type="number" id="ip-chsettings-default-setpoint" class="big-readout stepper-input" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-default-setpoint" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Temperature Sensor Adjustment (Degrees)</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-temp-sensor-adjustment-degrees" data-step="-0.1">-</button>
+                            <input type="number" id="ip-temp-sensor-adjustment-degrees" class="big-readout stepper-input" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="ip-temp-sensor-adjustment-degrees" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Heatup Rate (Degrees per hour)</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-heatup-rate" data-step="-0.1">-</button>
+                            <input type="number" id="ip-chsettings-heatup-rate" class="big-readout stepper-input" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-heatup-rate" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Hysteresis Band</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-hysteresis-band" data-step="-0.1">-</button>
+                            <input type="number" id="ip-chsettings-hysteresis-band" class="big-readout stepper-input" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-hysteresis-band" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Minimum On Seconds (Secs)</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-min-on-seconds" data-step="-1">-</button>
+                            <input type="number" id="ip-chsettings-min-on-seconds" class="big-readout stepper-input" step="1" min="0">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-min-on-seconds" data-step="1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Minimum Off Seconds (Secs)</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-min-off-seconds" data-step="-1">-</button>
+                            <input type="number" id="ip-chsettings-min-off-seconds" class="big-readout stepper-input" step="1" min="0">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-min-off-seconds" data-step="1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Warmup Minimum Startup Time (Mins)</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-min-startup-time" data-step="-1">-</button>
+                            <input type="number" id="ip-chsettings-min-startup-time" class="big-readout stepper-input" step="1" min="0">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-min-startup-time" data-step="1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Warmup Maximum Startup Time (Mins)</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-max-startup-time" data-step="-1">-</button>
+                            <input type="number" id="ip-chsettings-max-startup-time" class="big-readout stepper-input" step="1" min="0">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-max-startup-time" data-step="1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Warmup Target Setpoint Offset (Degrees)</div>
+                    <div class="panel-body">
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-target-setpoint-offset" data-step="-0.1">-</button>
+                            <input type="number" id="ip-chsettings-target-setpoint-offset" class="big-readout stepper-input" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="ip-chsettings-target-setpoint-offset" data-step="0.1">+</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Comfort</div>
+                    <div class="panel-body">
+                        <div class="radio-row">
+                            <label><input type="radio" name="COMFORT" id="COMFORT_ON" value="On"> On</label>
+                            <label><input type="radio" name="COMFORT" id="COMFORT_OFF" value="Off"> Off</label>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-body">
+                        <div class="minor-status">
+                            Changes are applied live after validation.
+                        </div>
+                        <div class="minor-status" id="chsettings-save-status">Ready</div>
+                    </div>
+                </section>
+
+            </div>
+        </main>
+
+        <footer class="page-footer">
+            <div class="footer-nav">
+                <a href="/web/chprogs.html">Heat Programs</a>
+                <a href="/web/syssettings.html">System Settings</a>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/common.js"></script>
+    <script src="/static/chsettings.js"></script>
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DwellPi - Heating Program Details</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="page" id="dwellpi-chprogdetails-page">
+
+        <header class="page-header">
+            <a href="/web/chprogs.html" class="header-btn left">Heat<br>Programs</a>
+            <div class="header-title">
+                <h1>DwellPi</h1>
+                <div>Heating Program Details</div>
+            </div>
+            <a href="/web/chsettings.html" class="header-btn right">Heating<br>Settings</a>
+        </header>
+
+        <main class="page-content">
+            <section class="panel">
+                <div class="panel-title-row">
+                    <span>Program Details</span>
+                    <div class="detail-actions">
+                        <button id="bt-prog-save" class="small-action-btn">Save</button>
+                        <button id="bt-prog-copy" class="small-action-btn">Copy</button>
+                        <button id="bt-prog-delete" class="small-action-btn danger-btn">Delete</button>
+                        <button id="bt-prog-cancel" class="small-action-btn">Cancel</button>
+                    </div>
+                </div>
+
+                <div class="panel-body">
+                    <div class="form-row">
+                        <label for="prog-start">Start Time</label>
+                        <input type="time" id="prog-start" value="07:00">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="prog-end">End Time</label>
+                        <input type="time" id="prog-end" value="10:00">
+                    </div>
+
+                    <div class="form-row">
+                        <label>Days</label>
+                        <div class="days-grid">
+                            <label><input type="checkbox" id="day-mon"> Mon</label>
+                            <label><input type="checkbox" id="day-tue"> Tue</label>
+                            <label><input type="checkbox" id="day-wed"> Wed</label>
+                            <label><input type="checkbox" id="day-thu"> Thu</label>
+                            <label><input type="checkbox" id="day-fri"> Fri</label>
+                            <label><input type="checkbox" id="day-sat"> Sat</label>
+                            <label><input type="checkbox" id="day-sun"> Sun</label>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="prog-setpoint">Setpoint</label>
+                        <input type="number" id="prog-setpoint" step="0.1" min="0" max="25" value="19.5">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="prog-warmup">Warmup</label>
+                        <select id="prog-warmup">
+                            <option value="on">On</option>
+                            <option value="off">Off</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label for="prog-enabled">Active</label>
+                        <select id="prog-enabled">
+                            <option value="on">On</option>
+                            <option value="off">Off</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label for="prog-note">Note</label>
+                        <input type="text" id="prog-note" style="width: 100%;">
+                    </div>
+                </div>
+            </section>
+
+            <section class="system-section">
+                <div class="system-line" id="chprogdetails-status-line">Heating program details page ready.</div>
+            </section>
+        </main>
+
+        <footer class="page-footer">
+            <div class="footer-nav">
+                <a href="/web/chprogs.html">Heat Programs</a>
+                <a href="/web/syssettings.html">System Settings</a>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/chprogdetails.js"></script>
+</body>
+</html>
