@@ -1,0 +1,610 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #e9edf1;
+    color: #222;
+}
+
+/* Page layout */
+.page {
+    max-width: 1100px;
+    margin: 0 auto;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.page-header,
+.page-footer,
+.page-content {
+    width: 100%;
+    padding-left: 10px;
+    padding-right: 10px;
+}
+
+/* Header */
+.page-header {
+    display: grid;
+    grid-template-columns: 1fr 1.5fr 1fr;
+    gap: 8px;
+}
+
+.header-title {
+    text-align: center;
+}
+
+.header-title h1 {
+    margin: 0;
+    font-size: 1.6rem;
+}
+
+.header-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 50px;
+    padding: 8px 4px;
+    text-align: center;
+    text-decoration: none;
+    line-height: 1.1;
+    font-size: 0.85rem;
+    color: #222;
+    background: #fff;
+    border: 1px solid #aeb6bf;
+    border-radius: 8px;
+}
+
+/* Main two-column layout */
+.grid-two {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    width: 100%;
+}
+
+.system-column {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+}
+
+/* Panels */
+.panel {
+    min-width: 0;
+    overflow: hidden;
+    background: #fff;
+    border: 1px solid #b8c0c8;
+    border-radius: 8px;
+}
+
+.panel-title,
+.panel-title-row {
+    padding: 10px 12px;
+    font-weight: bold;
+    background: #d8dde3;
+    border-bottom: 1px solid #b8c0c8;
+}
+
+.panel-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.panel-subtitle {
+    padding: 8px 12px 0 12px;
+    font-size: 0.95rem;
+    color: #555;
+}
+
+.panel-body {
+    min-width: 0;
+    padding: 8px;
+}
+
+/* Thermometer */
+.thermometer-body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    min-height: 280px;
+    padding: 10px 0;
+}
+
+#TemperatureGauge {
+    width: 100%;
+    max-width: 180px;
+    height: auto;
+}
+
+.thermometer-reading {
+    text-align: center;
+}
+
+.thermo-label {
+    margin-bottom: 8px;
+    font-size: 1rem;
+    color: #555;
+}
+
+.thermo-value {
+    font-size: 3rem;
+    font-weight: bold;
+}
+
+/* Inputs */
+.big-readout,
+.boost-readout,
+select {
+    width: 100%;
+    padding: 8px;
+    font-size: 1rem;
+}
+
+input.saving {
+    border-color: orange;
+}
+
+input.saved {
+    border-color: #4caf50;
+}
+
+/* Setpoint / steppers */
+.setpoint-panel {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 120px;
+}
+
+.setpoint-panel .stepper-row {
+    width: 100%;
+    margin: 0 auto;
+}
+
+.stepper-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    min-width: 0;
+}
+
+.stepper-input {
+    flex: 1 1 auto;
+    width: 100%;
+    min-width: 0;
+    text-align: center;
+    font-size: clamp(1rem, 4vw, 1.4rem);
+    font-variant-numeric: tabular-nums;
+}
+
+.stepper-input.big-readout {
+    font-size: clamp(1.05rem, 4.2vw, 1.4rem);
+}
+
+.stepper-btn {
+    flex: 0 0 48px;
+    width: 48px;
+    min-width: 48px;
+    height: 48px;
+    min-height: 48px;
+    padding: 0;
+    font-size: 1.2rem;
+    font-weight: 700;
+    line-height: 1;
+    background: #f5f5f5;
+    border: 1px solid #bbb;
+    border-radius: 10px;
+}
+
+.stepper-btn:active {
+    transform: scale(0.98);
+}
+
+/* Buttons */
+button:hover,
+.table-btn:hover,
+.small-action-btn:hover,
+.advance-btn:hover,
+.button-row button:hover,
+.table-btn-link:hover,
+.menu-link-btn:hover {
+    background: #e8e8e8;
+}
+
+.advance-btn {
+    width: 100%;
+    font-weight: bold;
+}
+
+.advance-btn-large {
+    width: 100%;
+    min-height: 56px;
+    font-size: 1.15rem;
+    font-weight: 600;
+}
+
+.large-btn {
+    min-height: 52px;
+    font-size: 1.05rem;
+    font-weight: 600;
+}
+
+.large-select {
+    min-height: 52px;
+    font-size: 1rem;
+}
+
+.button-row {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-width: 0;
+}
+
+.button-row button {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 2px;
+    font-size: 0.85rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.button-row-two {
+    display: flex;
+}
+
+.button-row-two > * {
+    flex: 1;
+}
+
+.button-row-three button {
+    flex: 1 1 33.33%;
+}
+
+.button-row-large {
+    gap: 0.75rem;
+}
+
+/* Active state */
+.advance-btn.active,
+.large-btn.active {
+    color: #fff !important;
+    background-color: #ff9800 !important;
+    border-color: #e68a00;
+    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.advance-btn.active:hover,
+.large-btn.active:hover {
+    color: #fff !important;
+    background-color: #f57c00 !important;
+}
+
+/* Status / text blocks */
+.demand-status {
+    font-weight: bold;
+}
+
+.status-body {
+    min-height: 60px;
+    font-family: monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.minor-status {
+    margin-top: 10px;
+    color: #555;
+}
+
+.system-section {
+    margin-top: 14px;
+    padding: 12px;
+    background: #fff;
+    border: 1px solid #b8c0c8;
+    border-radius: 8px;
+}
+
+.system-line {
+    padding: 6px 0;
+}
+
+.sr-only {
+    position: absolute;
+    left: -9999px;
+}
+
+/* Footer */
+.footer-nav {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.footer-nav a {
+    padding: 12px;
+    text-align: center;
+    text-decoration: none;
+    font-weight: bold;
+    color: #222;
+    background: #fff;
+    border: 1px solid #aeb6bf;
+    border-radius: 8px;
+}
+
+/* General grouped stacks */
+.settings-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.radio-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+}
+
+.radio-row label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* Tables */
+.programs-table-wrap {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.programs-table {
+    width: 100%;
+    min-width: 720px;
+    font-size: 0.95rem;
+    border-collapse: collapse;
+}
+
+.programs-table th,
+.programs-table td {
+    padding: 10px 8px;
+    text-align: left;
+    vertical-align: middle;
+    background: #fff;
+    border: 1px solid #b8c0c8;
+}
+
+.programs-table th {
+    font-weight: bold;
+    background: #d8dde3;
+}
+
+.programs-table td:first-child,
+.programs-table th:first-child {
+    width: 72px;
+    min-width: 72px;
+    text-align: center;
+}
+
+.programs-table td:last-child,
+.programs-table th:last-child {
+    min-width: 180px;
+}
+
+.programs-table td {
+    word-break: break-word;
+    white-space: normal;
+}
+
+
+/* Small buttons / links */
+.table-btn,
+.small-action-btn {
+    padding: 8px 10px;
+    font-size: 0.9rem;
+    background: #f4f4f4;
+    border: 1px solid #9099a3;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.table-btn-link {
+    display: inline-block;
+    padding: 8px 10px;
+    font-size: 0.9rem;
+    text-decoration: none;
+    color: #222;
+    background: #f4f4f4;
+    border: 1px solid #9099a3;
+    border-radius: 6px;
+}
+
+/* Forms */
+.details-form {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    margin-bottom: 12px;
+}
+
+.form-row label {
+    font-weight: bold;
+    color: #444;
+}
+
+.form-row input[type="text"],
+.form-row input[type="number"],
+.form-row input[type="time"],
+.form-row select {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* Day selection */
+.days-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+}
+
+.days-grid label,
+.inline-options label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: normal;
+}
+
+.inline-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+}
+
+/* Detail page action area */
+.detail-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.detail-actions .small-action-btn {
+    min-width: 80px;
+}
+
+/* Menu buttons */
+.menu-link-btn {
+    display: block;
+    padding: 12px;
+    text-align: center;
+    text-decoration: none;
+    font-weight: bold;
+    color: #222;
+    background: #f4f4f4;
+    border: 1px solid #9099a3;
+    border-radius: 6px;
+}
+
+.danger-btn {
+    border-color: #b66;
+}
+
+/* Medium-small screens */
+@media (max-width: 480px) {
+    .button-row-three {
+        flex-wrap: wrap;
+    }
+
+    .button-row-three button {
+        flex: 1 1 100%;
+    }
+}
+
+/* Small phones */
+@media (max-width: 380px) {
+    .page-header,
+    .page-footer,
+    .page-content {
+        padding-left: 6px;
+        padding-right: 6px;
+    }
+
+    .grid-two {
+        gap: 8px;
+    }
+
+    .panel-body {
+        padding: 6px;
+    }
+
+    .page-header {
+        grid-template-columns: 0.95fr 1.1fr 0.95fr;
+        gap: 6px;
+    }
+
+    .header-title h1 {
+        font-size: 1.35rem;
+    }
+
+    .header-btn {
+        min-height: 46px;
+        padding: 6px 3px;
+        font-size: 0.78rem;
+    }
+
+    .button-row button {
+        padding: 8px 2px;
+        font-size: 0.8rem;
+    }
+
+    .big-readout,
+    .boost-readout,
+    select {
+        font-size: 0.95rem;
+    }
+
+    .thermo-value {
+        font-size: 2.4rem;
+    }
+
+    .stepper-row {
+        gap: 6px;
+    }
+
+    .stepper-btn {
+        flex: 0 0 40px;
+        width: 40px;
+        min-width: 40px;
+        height: 40px;
+        min-height: 40px;
+        font-size: 1rem;
+    }
+
+    .stepper-input,
+    .stepper-input.big-readout {
+        padding-left: 6px;
+        padding-right: 6px;
+        font-size: clamp(0.95rem, 4vw, 1.15rem);
+    }
+}
+
+/* Very tiny screens only */
+@media (max-width: 300px) {
+    .grid-two {
+        grid-template-columns: 1fr;
+    }
+
+    .page-header {
+        grid-template-columns: 1fr;
+        text-align: center;
+    }
+
+    .header-btn {
+        margin-bottom: 5px;
+    }
+
+    .footer-nav {
+        grid-template-columns: 1fr;
+    }
+
+    .thermo-value {
+        font-size: 2rem;
+    }
+}
