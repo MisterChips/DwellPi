@@ -86,6 +86,8 @@ class RpcServer(threading.Thread):
             try:
                 srv.settimeout(0.5)
                 conn, _ = srv.accept()
+            except socket.timeout:
+                continue
             except Exception:
                 continue
 

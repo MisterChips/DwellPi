@@ -312,6 +312,11 @@ class RelayProcess(SettingsClient):
 
         print("[Relay] Started in mode: %s" % self.mode)
 
+        try:
+            self.db_queue.put(Message("relay", "request_settings_snapshot", {}))
+        except Exception:
+            pass
+
         ok = self.wait_for_initial_snapshot(timeout=3.0)
         if not ok:
             print("[Relay] No settings snapshot received yet; using defaults (RELAY_ENABLE=False)")
@@ -349,17 +354,28 @@ class RelayProcess(SettingsClient):
                     if self._hardware_allowed() and (not self.ctrl.started):
                         print("[Relay] RELAY_ENABLE=True -> starting LLAP")
                         self.ctrl.relay_device_id = self.relay_device_id
-                        self.ctrl.start()
-                        self._publish_ui_state()
-                        self._publish_web_state()
+                        try:
+                            self.ctrl.start()
+                            self._publish_ui_state()
+                            self._publish_web_state()
+                        except Exception as e:
+                            print("[Relay] Failed to start LLAP: %s" % e)
+                            try:
+                                self.db_queue.put(Message("relay", "state_change", {
+                                    "system": "RELAY",
+                                    "state": "LLAP_START_FAILED: %s" % e
+                                }))
+                            except Exception:
+                                pass
+
                     elif (not self._hardware_allowed()) and self.ctrl.started:
                         print("[Relay] RELAY_ENABLE=False -> stopping LLAP")
                         try:
                             self.ctrl.stop()
-                        except Exception:
-                            pass
-                        self._publish_ui_state()
-                        self._publish_web_state()
+                            self._publish_ui_state()
+                            self._publish_web_state()
+                        except Exception as e:
+                            print("[Relay] Failed to stop LLAP: %s" % e)
 
                 # heartbeat (so supervisor can watchdog it)
                 now = time.time()
@@ -388,9 +404,8 @@ class RelayProcess(SettingsClient):
 
                         # state can be "ON"/"OFF" or bool-ish
                         try:
-                            basestring  # noqa
                             is_str = isinstance(state, basestring)
-                        except Exception:
+                        except NameError:
                             is_str = isinstance(state, str)
 
                         if is_str:
@@ -452,7 +467,6 @@ class RelayProcess(SettingsClient):
 
                     elif msg.type == "relay_status":
                         request_id = getattr(msg, "request_id", None)
-                        p = msg.payload or {}
 
                         try:
                             st = self.ctrl.get_status()
@@ -499,7 +513,6 @@ class RelayProcess(SettingsClient):
 
                     elif msg.type == "relay_info":
                         request_id = getattr(msg, "request_id", None)
-                        p = msg.payload or {}
 
                         print("[Relay] relay_info request received request_id=%r" % request_id)
 

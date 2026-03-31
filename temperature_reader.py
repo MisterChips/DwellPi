@@ -7,6 +7,7 @@ from __future__ import print_function
 import time
 import os
 
+
 class TemperatureReader(object):
     def __init__(self, sensor_device_id, max_jump_c=3.0, retries=5, retry_delay=0.2):
         self.sensor_device_id = sensor_device_id
@@ -14,6 +15,7 @@ class TemperatureReader(object):
         self.retries = int(retries)
         self.retry_delay = float(retry_delay)
         self.last_good = None
+        self.path = None
 
         # Try both common locations
         self.paths = [
@@ -28,10 +30,13 @@ class TemperatureReader(object):
         raise IOError("w1 sensor file not found. Tried: %s" % (", ".join(self.paths)))
 
     def read_c(self):
-        path = self._get_path()
+        if not self.path:
+            self.path = self._get_path()
 
+        path = self.path
         last_exc = None
-        for _ in range(self.retries):
+
+        for i in range(self.retries):
             try:
                 with open(path, "r") as f:
                     lines = f.read().strip().splitlines()
@@ -45,11 +50,10 @@ class TemperatureReader(object):
                     raise ValueError("crc not YES: %r" % line0)
 
                 line1 = lines[1]
-                idx = line1.find("t=")
-                if idx == -1:
+                if "t=" not in line1:
                     raise ValueError("no t= field: %r" % line1)
 
-                raw = line1[idx + 2:].strip()
+                raw = line1.split("t=")[-1].strip()
                 temp_c = float(raw) / 1000.0
                 temp_c = round(temp_c, 1)
 
@@ -63,12 +67,16 @@ class TemperatureReader(object):
 
             except Exception as e:
                 last_exc = e
-                time.sleep(self.retry_delay)
+                self.path = None
+                if i < (self.retries - 1):
+                    time.sleep(self.retry_delay)
+                try:
+                    path = self._get_path()
+                except Exception as path_exc:
+                    last_exc = path_exc
 
         # If we repeatedly fail, fall back to last good if we have it
         if self.last_good is not None:
-            # Optional: helpful for debugging
-            # print("[TempReader] WARNING: returning last_good=%.1f due to: %s" % (self.last_good, last_exc))
             return self.last_good
 
         raise last_exc

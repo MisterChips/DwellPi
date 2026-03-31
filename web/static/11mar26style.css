@@ -1,0 +1,352 @@
+/* Hide HTML5 Up and Down arrows. */
+input[type="number"]::-webkit-outer-spin-button, input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+input[type="number"] {
+    -moz-appearance: textfield;
+}
+
+input[type="time"]::-webkit-clear-button {
+    display: none;
+}
+
+input[type="time"] {
+    -moz-appearance: textfield;
+}
+
+/*
+//Start
+//jQuery Mobile CSS Overrides
+*/
+
+.ui-bar h1 {
+    font-size: 1.68em;
+}
+
+.ui-bar h2 {
+    font-size: 1.25em;
+}
+
+.ui-input-text input {
+    text-align: center;
+}
+
+.ui-content {
+    padding: 0;
+    text-align:center;
+}
+
+.ui-bar, .side-pad {
+    padding: 0 10px;
+}
+
+/*
+//jQuery Mobile CSS Overrides
+//End
+*/
+
+.section.setpoint {
+    height:180px;
+    padding: 10px 0px;
+}
+
+.section.thermometer{
+    height:200px;
+    padding: 0;
+}
+
+.thermometer-gauge {
+    height: 200px;
+    width: 200px;
+}
+
+.input-with-inc-dec-buttons > :nth-child(1) {
+    width:65%;
+}
+
+.input-with-inc-dec-buttons > :nth-child(2) {
+    width:35%;
+}
+
+.setpoint-input-section{
+    height:89px;
+}
+
+.setpoint-input-section, .set-button{
+    border-style: hidden;
+    font-size: 1.68em;
+}
+
+.setpoint-input-section > .inc-dec-button {
+    margin-bottom: 3px;
+    margin-right: 0;
+    margin-top: 9px;
+}
+
+.setpoint-set-button{
+    height: 51px;
+    margin-bottom: 8px;
+    margin-top: 8px;
+    padding-bottom: 6px;
+    padding-top: 6px;
+}
+
+.boost-section{
+    height: 180px;
+    padding: 0;
+}
+
+.inline{
+    display:inline-block;
+}
+
+.boost-label{
+    font-size: .95em;
+    margin-bottom: -4px;
+}
+
+.boost-input{
+    border-style: hidden;
+    font-size: 1.25em;
+    height: 74px;
+}
+
+.input-boost-text, .input-setpoint-text{
+    font-size: 1.1em;
+}
+
+.boost-inc-dec-buttons{
+    border-style: hidden;
+    height:74px;
+}
+
+.heat-water-set-button{
+    border-style: hidden;;
+}
+
+.heat-water-set{
+    font-size: .95em;
+    margin-left: 0;
+}
+
+.advance{
+    margin-left: 0;
+}
+
+.boost-inc-dec-buttons > .inc-dec-button {
+    margin: 5px 0 0;
+}
+
+.status-message {
+    font-size: .85em;
+    max-height: 200px;
+    min-height: 32px;
+}
+
+.status-body {
+    font-size: 85%;
+}
+
+.last-msg-sys-status-section {
+    font-size: .625em;
+}
+
+.state{
+    max-height: 200px;
+}
+
+.divider{
+    background-color: #ddd;
+    height: 1px;
+
+
+}
+
+.section-label {
+    font-size: 1.25em;
+    padding-top: 2px;
+    font-weight: 700;
+}
+
+/*
+//Start
+//settings styles
+*/
+
+.settings-page h1 {
+    font-size: 1.2em;
+    margin: 6px 0;
+}
+
+.settings-page h2 {
+    font-size: 1em;
+}
+
+
+.settings-page .ui-field-contain{
+    padding: 6px 10px;
+    border-bottom-width: 0px;
+}
+
+.settings-page .setpoint-input-section{
+    height:76px;
+}
+
+.settings-page .setpoint-input-section,.settings-page .set-button{
+    font-size: 1.5em;
+}
+
+.settings-page .setpoint-input-section > .inc-dec-button {
+    margin: 5px 0 0;
+}
+
+.settings-page .status-message {
+    font-size: 1em;
+}
+
+/*
+//settings styles
+//End
+*/
+
+/*
+//Start
+//programs styles
+*/
+
+
+.programs-page .ui-bar, .ui-bar-programs{
+    border-style: hidden solid solid;
+    border-width: 1px;
+    border-color: #ddd;
+    padding: 4px 0;
+    font-size: .84em;
+}
+
+.programs-page .ui-bar.grid-header, .ui-bar-programs .ui-bar.grid-header{
+    border-style: solid solid solid;
+}
+
+.programs-page .ui-grid-d, .ui-bar-program .ui-grid-d{
+    padding: 0px;
+}
+
+button.add-button {
+    margin: 10px;
+    padding: 0;
+}
+
+button.edit-button {
+    margin: 0;
+}
+
+.fetch-special-button{
+    margin-left: 10px;
+}
+
+.ui-grid-d.programs > :nth-child(1) {
+    width:12%;
+}
+
+
+.programs .ui-block-a{
+    width:12%;
+}
+
+.programs .ui-block-b{
+    width:24%;
+}
+
+.programs .ui-block-c{
+    width:23%;
+}
+
+#dwellpi-hwprogs-page .programs .ui-block-c{
+    width:39%;
+}
+
+.programs .ui-block-d{
+    width:16%;
+}
+
+#dwellpi-hwprogs-page .programs .ui-block-d{
+    width:25%;
+}
+
+.programs .ui-block-e{
+    width:25%;
+}
+
+.programs-page .ui-btn-inline.add-button{
+    margin-right: 0;
+}
+
+/*
+//programs styles
+//End
+*/
+
+/*
+//Start
+//holidays styles
+*/
+
+#dwellpi-holiday-progs-page .programs .ui-block-b, #dwellpi-holiday-progs-page .programs .ui-block-c{
+    width:32%;
+}
+
+#dwellpi-holiday-progs-page .programs .ui-block-d{
+    width:24%;
+}
+/*
+//End
+//holidays page specific styles
+*/
+
+/*
+//specials page specific styles
+//Start
+*/
+
+#dwellpi-special-progs-page .programs .ui-block-b, #dwellpi-special-progs-page .programs .ui-block-c{
+    width:18%;
+}
+
+#dwellpi-special-progs-page .programs .ui-block-d{
+    width:24%;
+}
+
+#dwellpi-special-progs-page .programs .ui-block-e{
+    width:28%;
+}
+
+//specials styles
+//End
+*/
+
+/*
+//Start
+//ProgDetails styles
+*/
+
+.detail-header button.ui-btn{
+    height: 34.5px;
+    width: 86.75px;
+}
+
+/*
+//ProgDetails styles
+//End
+*/
+
+/*
+//Start
+//Popups styles
+*/
+
+/*
+//Popups styles
+//End
+*/

@@ -11,7 +11,6 @@ except ImportError:
 import sqlite3, time, traceback
 from message_schema import Message
 import datetime
-import calendar
 
 try:
     # reuse your validation + schema
@@ -23,10 +22,36 @@ except Exception:
 
 
 class DBWorker(object):
+    PROGRAM_COLUMNS = (
+        "id", "schedule_set_name", "system", "start_time", "end_time",
+        "days", "setpoint", "warmup", "note", "enabled"
+    )
+
+    HOLIDAY_COLUMNS = (
+        "id", "start_ts_epoch", "start_ts_text", "end_ts_epoch",
+        "end_ts_text", "systems", "enabled", "note"
+    )
+
+    SPECIAL_PERIOD_COLUMNS = (
+        "id", "start_ts_epoch", "start_ts_text", "end_ts_epoch",
+        "end_ts_text", "systems", "schedule_set_name", "enabled", "note"
+    )
+
+    SCHEDULE_SET_COLUMNS = (
+        "name", "enabled", "note"
+    )
+
+    STATE_LOG_COLUMNS = (
+        "ts_epoch", "ts", "system", "state"
+    )
+
+    TEMPERATURE_LOG_COLUMNS = (
+        "ts_epoch", "ts", "source", "value"
+    )
+
     def __init__(self, db_path, mode):
         self.db_path = db_path
         self.mode = mode
-        self.running = True
         self.conn = None
         self.last_prune_ts = 0.0
 
@@ -47,7 +72,8 @@ class DBWorker(object):
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
 
-        # ensure tables exist (init script should do this, but harmless here)
+        # Ensure core runtime tables exist.
+        # Full schema is expected to be created by db_init before this worker starts.
         self.conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS temperature_log (ts_epoch REAL, ts TEXT, source TEXT, value REAL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS state_log (ts_epoch REAL, ts TEXT, system TEXT, state TEXT)")
@@ -77,6 +103,187 @@ class DBWorker(object):
         except Exception:
             return 600
 
+    def _ok_id_response(self, msg, msg_type, item_id, extra=None):
+        payload = {"ok": True, "id": item_id}
+        if extra:
+            payload.update(extra)
+        return self._make_response(msg, msg_type, payload)
+
+    def _error_response(self, msg, msg_type, error_text, extra=None):
+        payload = {"ok": False, "error": error_text}
+        if extra:
+            payload.update(extra)
+        return self._make_response(msg, msg_type, payload)
+
+    def _fetch_one(self, sql, params=()):
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+    def _fetch_all(self, sql, params=()):
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+    def _fetch_one_dict(self, columns, sql, params=()):
+        row = self._fetch_one(sql, params)
+        if row is None:
+            return None
+        return self._row_to_dict(columns, row)
+
+    def _fetch_all_dicts(self, columns, sql, params=()):
+        rows = self._fetch_all(sql, params)
+        return self._rows_to_dicts(columns, rows)
+
+    def _find_overlapping_period(self, table_name, start_ts_epoch, end_ts_epoch, systems, exclude_id=None):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, start_ts_epoch, end_ts_epoch, systems
+            FROM %s
+            WHERE enabled = 1
+        """ % table_name)
+        rows = cur.fetchall()
+
+        for row in rows:
+            row_id = row[0]
+            row_start = float(row[1])
+            row_end = float(row[2])
+            row_systems = row[3]
+
+            if exclude_id is not None and row_id == exclude_id:
+                continue
+
+            if not self._systems_overlap(systems, row_systems):
+                continue
+
+            if start_ts_epoch < row_end and end_ts_epoch > row_start:
+                return row_id
+
+        return None
+
+    def _find_overlapping_holiday(self, start_ts_epoch, end_ts_epoch, systems, exclude_id=None):
+        return self._find_overlapping_period(
+            "away_periods", start_ts_epoch, end_ts_epoch, systems, exclude_id
+        )
+
+    def _find_overlapping_special(self, start_ts_epoch, end_ts_epoch, systems, exclude_id=None):
+        return self._find_overlapping_period(
+            "special_periods", start_ts_epoch, end_ts_epoch, systems, exclude_id
+        )
+
+    def _parse_program_payload(self, payload, require_id=False):
+        p = payload or {}
+
+        if require_id:
+            try:
+                program_id = int(p.get("id"))
+            except Exception:
+                raise ValueError("Invalid program id")
+        else:
+            program_id = None
+
+        start_time = str(p.get("start_time") or "").strip()
+        end_time = str(p.get("end_time") or "").strip()
+        days = str(p.get("days") or "").strip()
+        note = str(p.get("note") or "").strip()
+        schedule_set_name = str(p.get("schedule_set_name") or "NORMAL").strip().upper()
+        system = str(p.get("system") or "CH").strip().upper()
+        enabled = 1 if p.get("enabled") else 0
+
+        if system not in ("CH", "HW"):
+            raise ValueError("Invalid system")
+
+        if not start_time or not end_time or not days:
+            raise ValueError("Missing required fields")
+
+        if system == "CH":
+            try:
+                setpoint = float(p.get("setpoint"))
+            except Exception:
+                raise ValueError("Invalid setpoint")
+            warmup = 1 if p.get("warmup") else 0
+        else:
+            setpoint = None
+            warmup = 0
+
+        return {
+            "id": program_id,
+            "start_time": start_time,
+            "end_time": end_time,
+            "days": days,
+            "note": note,
+            "schedule_set_name": schedule_set_name,
+            "system": system,
+            "enabled": enabled,
+            "setpoint": setpoint,
+            "warmup": warmup,
+        }
+
+
+    def _get_log_items_for_day(self, table_name, columns, date_text):
+        start_epoch, end_epoch, day_used = self._get_day_range_epoch(date_text)
+
+        items = self._fetch_all_dicts(
+            columns,
+            """
+            SELECT %s
+            FROM %s
+            WHERE ts_epoch >= ? AND ts_epoch < ?
+            ORDER BY ts_epoch DESC
+            """ % (", ".join(columns), table_name),
+            (start_epoch, end_epoch)
+        )
+
+        return day_used, items
+
+    def _ensure_schedule_set_exists(self, schedule_set_name):
+        cur = self.conn.cursor()
+        cur.execute("SELECT name FROM schedule_sets WHERE name = ?", (schedule_set_name,))
+        if cur.fetchone() is not None:
+            return
+
+        try:
+            self._begin()
+            cur.execute(
+                "INSERT INTO schedule_sets (name, enabled, note) VALUES (?, ?, ?)",
+                (schedule_set_name, 1, "")
+            )
+            self._commit()
+        except Exception:
+            self._rollback_quiet()
+            raise
+
+    def _insert_row(self, table, columns, values):
+        cur = self.conn.cursor()
+        self._begin()
+        placeholders = ",".join(["?"] * len(values))
+        cur.execute(
+            "INSERT INTO %s (%s) VALUES (%s)" % (table, columns, placeholders),
+            values
+        )
+        new_id = cur.lastrowid
+        self._commit()
+        return new_id
+
+    def _update_row_by_id(self, table, set_clause, values, item_id):
+        cur = self.conn.cursor()
+        self._begin()
+        cur.execute(
+            "UPDATE %s SET %s WHERE id = ?" % (table, set_clause),
+            tuple(values) + (item_id,)
+        )
+        changed = cur.rowcount
+        self._commit()
+        return changed
+
+    def _delete_by_id(self, table, item_id):
+        cur = self.conn.cursor()
+        self._begin()
+        cur.execute("DELETE FROM %s WHERE id = ?" % table, (item_id,))
+        changed = cur.rowcount
+        self._commit()
+        return changed
+
     def prune_old_data(self, days_to_keep=30):
         now = time.time()
         # 86400 seconds in a day
@@ -84,7 +291,7 @@ class DBWorker(object):
 
         cur = self.conn.cursor()
         try:
-            cur.execute("BEGIN IMMEDIATE")
+            self._begin()
 
             # Delete old temperatures
             cur.execute("DELETE FROM temperature_log WHERE ts_epoch < ?", (cutoff_epoch,))
@@ -94,7 +301,7 @@ class DBWorker(object):
             cur.execute("DELETE FROM state_log WHERE ts_epoch < ?", (cutoff_epoch,))
             state_deleted = cur.rowcount
 
-            self.conn.commit()
+            self._commit()
 
             if temp_deleted > 0 or state_deleted > 0:
                 print("[DB] Pruning Complete: Removed %d temp rows and %d state rows." %
@@ -105,7 +312,7 @@ class DBWorker(object):
                 # self.conn.execute("VACUUM")
 
         except Exception:
-            self.conn.rollback()
+            self._rollback_quiet()
             print("[DB] ERROR during pruning")
             traceback.print_exc()
 
@@ -120,8 +327,8 @@ class DBWorker(object):
         start_dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
         end_dt = start_dt + datetime.timedelta(days=1)
 
-        start_epoch = calendar.timegm(start_dt.timetuple())
-        end_epoch = calendar.timegm(end_dt.timetuple())
+        start_epoch = time.mktime(start_dt.timetuple())
+        end_epoch = time.mktime(end_dt.timetuple())
 
         # if today, only return up to "now"
         if start_dt.date() == now.date():
@@ -141,15 +348,15 @@ class DBWorker(object):
 
         try:
             # atomic batch update
-            cur.execute("BEGIN IMMEDIATE")
+            self._begin()
             for key in keys:
                 val = self.settings.get(key)
                 cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, val))
-            self.conn.commit()
+            self._commit()
             self.dirty.clear()
             print("[DB] Flushed settings:", keys)
         except Exception:
-            self.conn.rollback()
+            self._rollback_quiet()
             print("[DB] ERROR flushing settings")
             traceback.print_exc()
 
@@ -165,7 +372,7 @@ class DBWorker(object):
 
         cur = self.conn.cursor()
         try:
-            cur.execute("BEGIN IMMEDIATE")
+            self._begin()
 
             if self.temp_buf:
                 cur.executemany(
@@ -189,11 +396,11 @@ class DBWorker(object):
             #    )
             #    self.heartbeat_buf = []
 
-            self.conn.commit()
+            self._commit()
             self.last_log_flush = now
             # print("[DB] Log flush OK")
         except Exception:
-            self.conn.rollback()
+            self._rollback_quiet()
             print("[DB] ERROR flushing logs")
             traceback.print_exc()
 
@@ -228,62 +435,88 @@ class DBWorker(object):
             except Exception:
                 pass
 
-    def _reply_to_source(self, msg, resp, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                         web_ctrl_queue):
-        if msg.source == "engine":
-            engine_ctrl_queue.put(resp)
-        elif msg.source == "sensor":
-            sensor_ctrl_queue.put(resp)
-        elif msg.source == "relay":
-            relay_ctrl_queue.put(resp)
-        elif msg.source == "ui":
-            ui_ctrl_queue.put(resp)
-        elif msg.source == "web":
-            web_ctrl_queue.put(resp)
+    def _begin(self):
+        self.conn.cursor().execute("BEGIN IMMEDIATE")
 
-    def handle_get_setting(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                           web_ctrl_queue):
-        key = msg.payload.get("key")
-        val = self.settings.get(key)
+    def _commit(self):
+        self.conn.commit()
 
-        resp = Message(
-            source="db",
-            msg_type="setting_value",
-            payload={"key": key, "value": val},
+    def _rollback_quiet(self):
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+
+    def _row_to_dict(self, columns, row):
+        return dict(zip(columns, row))
+
+    def _rows_to_dicts(self, columns, rows):
+        return [self._row_to_dict(columns, row) for row in rows]
+
+    def _reply_queue_for_source(self, source, engine_ctrl_queue, sensor_ctrl_queue,
+                                relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+        return {
+            "engine": engine_ctrl_queue,
+            "sensor": sensor_ctrl_queue,
+            "relay": relay_ctrl_queue,
+            "ui": ui_ctrl_queue,
+            "web": web_ctrl_queue,
+        }.get(source)
+
+    def _make_response(self, msg, msg_type, payload):
+        return Message(
+            "db",
+            msg_type,
+            payload,
             target=msg.source,
             request_id=msg.request_id
         )
+
+    def _reply_to_source(self, msg, resp, engine_ctrl_queue, sensor_ctrl_queue,
+                         relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+        q = self._reply_queue_for_source(
+            msg.source,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
+
+        if q is None:
+            print("[DB] WARNING: unknown reply target source=%r" % (msg.source,))
+            return
+
+        try:
+            q.put(resp)
+        except Exception as e:
+            print("[DB] WARNING: failed reply to %r: %s" % (msg.source, e))
+
+    def handle_get_setting(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                           ui_ctrl_queue, web_ctrl_queue):
+        key = (msg.payload or {}).get("key")
+        val = self.settings.get(key)
+
+        resp = self._make_response(msg, "setting_value", {
+            "key": key,
+            "value": val
+        })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_get_programs(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                            web_ctrl_queue):
+    def handle_get_programs(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                            ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
         system = str(p.get("system") or "").upper()
         schedule_set_name = str(p.get("schedule_set_name") or "NORMAL").strip().upper()
 
         if system not in ("CH", "HW"):
-            resp = Message(
-                "db",
-                "programs_result",
-                {
-                    "ok": False,
-                    "error": "invalid system",
-                    "system": system,
-                    "schedule_set_name": schedule_set_name,
-                    "items": []
-                },
-                target=msg.source,
-                request_id=msg.request_id
-            )
-            print("[DB] programs_result -> %s ok=%s items=%s" % (
-                msg.source,
-                resp.payload.get("ok"),
-                len(resp.payload.get("items") or [])
-            ))
+            resp = self._make_response(msg, "programs_result", {
+                "ok": False,
+                "error": "invalid system",
+                "system": system,
+                "schedule_set_name": schedule_set_name,
+                "items": []
+            })
             self._reply_to_source(
                 msg, resp,
                 engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
@@ -291,74 +524,42 @@ class DBWorker(object):
             return
 
         try:
-            items = []
-            cur = self.conn.cursor()
-            cur.execute("""
-                        SELECT id,
-                               schedule_set_name,
-                               system,
-                               start_time,
-                               end_time,
-                               days,
-                               setpoint,
-                               warmup,
-                               note,
-                               enabled
-                        FROM schedule_entries
-                        WHERE schedule_set_name = ?
-                          AND system = ?
-                        ORDER BY start_time ASC, id ASC
-                        """, (schedule_set_name, system))
-
-            rows = cur.fetchall()
-            for r in rows:
-                items.append({
-                    "id": r[0],
-                    "schedule_set_name": r[1],
-                    "system": r[2],
-                    "start_time": r[3],
-                    "end_time": r[4],
-                    "days": r[5],
-                    "setpoint": r[6],
-                    "warmup": r[7],
-                    "note": r[8],
-                    "enabled": r[9],
-                })
-            resp = Message(
-                "db",
-                "programs_result",
-                {
-                    "ok": True,
-                    "system": system,
-                    "schedule_set_name": schedule_set_name,
-                    "items": items
-                },
-                target=msg.source,
-                request_id=msg.request_id
+            items = self._fetch_all_dicts(
+                self.PROGRAM_COLUMNS,
+                """
+                SELECT id, schedule_set_name, system, start_time, end_time,
+                       days, setpoint, warmup, note, enabled
+                FROM schedule_entries
+                WHERE schedule_set_name = ?
+                  AND system = ?
+                ORDER BY start_time ASC, id ASC
+                """,
+                (schedule_set_name, system)
             )
+
+            resp = self._make_response(msg, "programs_result", {
+                "ok": True,
+                "system": system,
+                "schedule_set_name": schedule_set_name,
+                "items": items
+            })
 
         except Exception as e:
-            resp = Message(
-                "db",
-                "programs_result",
-                {
-                    "ok": False,
-                    "error": str(e),
-                    "system": system,
-                    "schedule_set_name": schedule_set_name,
-                    "items": []
-                },
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "programs_result", {
+                "ok": False,
+                "error": str(e),
+                "system": system,
+                "schedule_set_name": schedule_set_name,
+                "items": []
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_get_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                           web_ctrl_queue):
+    def handle_get_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                           ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
         try:
             program_id = int(p.get("id"))
@@ -366,415 +567,296 @@ class DBWorker(object):
             program_id = None
 
         if program_id is None:
-            resp = Message(
-                "db",
-                "program_result",
-                {"ok": False, "error": "Invalid program id"},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "program_result", {
+                "ok": False,
+                "error": "Invalid program id"
+            })
             self._reply_to_source(
                 msg, resp,
                 engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
             )
             return
 
-        cur = self.conn.cursor()
-        cur.execute("""
-                    SELECT id,
-                           schedule_set_name,
-                           system,
-                           start_time,
-                           end_time,
-                           days,
-                           setpoint,
-                           warmup,
-                           note,
-                           enabled
-                    FROM schedule_entries
-                    WHERE id = ?
-                    LIMIT 1
-                    """, (program_id,))
-        row = cur.fetchone()
-
-        if not row:
-            resp = Message(
-                "db",
-                "program_result",
-                {"ok": False, "error": "Program not found", "id": program_id},
-                target=msg.source,
-                request_id=msg.request_id
+        try:
+            item = self._fetch_one_dict(
+                self.PROGRAM_COLUMNS,
+                """
+                SELECT id, schedule_set_name, system, start_time, end_time,
+                       days, setpoint, warmup, note, enabled
+                FROM schedule_entries
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (program_id,)
             )
-        else:
-            resp = Message(
-                "db",
-                "program_result",
-                {
+
+            if item is None:
+                resp = self._make_response(msg, "program_result", {
+                    "ok": False,
+                    "error": "Program not found",
+                    "id": program_id
+                })
+            else:
+                resp = self._make_response(msg, "program_result", {
                     "ok": True,
-                    "item": {
-                        "id": row[0],
-                        "schedule_set_name": row[1],
-                        "system": row[2],
-                        "start_time": row[3],
-                        "end_time": row[4],
-                        "days": row[5],
-                        "setpoint": row[6],
-                        "warmup": row[7],
-                        "note": row[8],
-                        "enabled": row[9],
-                    }
-                },
-                target=msg.source,
-                request_id=msg.request_id
-            )
+                    "item": item
+                })
+
+        except Exception as e:
+            resp = self._make_response(msg, "program_result", {
+                "ok": False,
+                "error": str(e),
+                "id": program_id
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_create_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                              web_ctrl_queue):
+    def handle_create_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                              ui_ctrl_queue, web_ctrl_queue):
+        try:
+            data = self._parse_program_payload(msg.payload, require_id=False)
+
+            if data["schedule_set_name"] != "NORMAL":
+                self._ensure_schedule_set_exists(data["schedule_set_name"])
+
+            new_id = self._insert_row(
+                "schedule_entries",
+                "schedule_set_name, system, start_time, end_time, days, setpoint, warmup, note, enabled",
+                (
+                    data["schedule_set_name"],
+                    data["system"],
+                    data["start_time"],
+                    data["end_time"],
+                    data["days"],
+                    data["setpoint"],
+                    data["warmup"],
+                    data["note"],
+                    data["enabled"],
+                )
+            )
+
+            resp = self._ok_id_response(msg, "create_program_result", new_id)
+
+        except Exception as e:
+            self._rollback_quiet()
+            resp = self._error_response(msg, "create_program_result", str(e))
+
+        self._reply_to_source(
+            msg, resp,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
+
+    def handle_update_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                              ui_ctrl_queue, web_ctrl_queue):
+        try:
+            data = self._parse_program_payload(msg.payload, require_id=True)
+
+            if data["schedule_set_name"] != "NORMAL":
+                self._ensure_schedule_set_exists(data["schedule_set_name"])
+
+            cur = self.conn.cursor()
+            self._begin()
+            cur.execute("""
+                UPDATE schedule_entries
+                SET schedule_set_name = ?,
+                    start_time        = ?,
+                    end_time          = ?,
+                    days              = ?,
+                    setpoint          = ?,
+                    warmup            = ?,
+                    note              = ?,
+                    enabled           = ?
+                WHERE id = ?
+                  AND system = ?
+            """, (
+                data["schedule_set_name"],
+                data["start_time"],
+                data["end_time"],
+                data["days"],
+                data["setpoint"],
+                data["warmup"],
+                data["note"],
+                data["enabled"],
+                data["id"],
+                data["system"],
+            ))
+            changed = cur.rowcount
+            self._commit()
+
+            if changed < 1:
+                resp = self._error_response(msg, "update_program_result", "Program not found")
+            else:
+                resp = self._ok_id_response(msg, "update_program_result", data["id"])
+
+        except Exception as e:
+            self._rollback_quiet()
+            resp = self._error_response(msg, "update_program_result", str(e))
+
+        self._reply_to_source(
+            msg, resp,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
+
+    def handle_delete_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                              ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
 
         try:
-            start_time = str(p.get("start_time") or "").strip()
-            end_time = str(p.get("end_time") or "").strip()
-            days = str(p.get("days") or "").strip()
-            note = str(p.get("note") or "").strip()
-            schedule_set_name = str(p.get("schedule_set_name") or "NORMAL").strip().upper()
-            system = str(p.get("system") or "CH").strip().upper()
-            enabled = 1 if p.get("enabled") else 0
+            program_id = int(p.get("id"))
+            system = str(p.get("system") or "").strip().upper()
 
             if system not in ("CH", "HW"):
                 raise ValueError("Invalid system")
 
-            if not start_time or not end_time or not days:
-                raise ValueError("Missing required fields")
-
-            if system == "CH":
-                setpoint = float(p.get("setpoint"))
-                warmup = 1 if p.get("warmup") else 0
-            else:
-                setpoint = None
-                warmup = 0
-
             cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("""
-                        INSERT INTO schedule_entries
-                        (schedule_set_name, system, start_time, end_time, days, setpoint, warmup, note, enabled)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (schedule_set_name, system, start_time, end_time, days, setpoint, warmup, note, enabled))
-            new_id = cur.lastrowid
-            self.conn.commit()
-
-            resp = Message(
-                "db",
-                "create_program_result",
-                {"ok": True, "id": new_id},
-                target=msg.source,
-                request_id=msg.request_id
+            self._begin()
+            cur.execute(
+                "DELETE FROM schedule_entries WHERE id = ? AND system = ?",
+                (program_id, system)
             )
+            changed = cur.rowcount
+            self._commit()
+
+            if changed < 1:
+                resp = self._error_response(msg, "delete_program_result", "Program not found")
+            else:
+                resp = self._ok_id_response(msg, "delete_program_result", program_id)
 
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "create_program_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            self._rollback_quiet()
+            resp = self._error_response(msg, "delete_program_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_update_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                              web_ctrl_queue):
+    def handle_copy_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                            ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
 
         try:
             program_id = int(p.get("id"))
-            start_time = str(p.get("start_time") or "").strip()
-            end_time = str(p.get("end_time") or "").strip()
-            days = str(p.get("days") or "").strip()
-            note = str(p.get("note") or "").strip()
-            schedule_set_name = str(p.get("schedule_set_name") or "NORMAL").strip().upper()
-            enabled = 1 if p.get("enabled") else 0
             system = str(p.get("system") or "").strip().upper()
 
             if system not in ("CH", "HW"):
                 raise ValueError("Invalid system")
 
-            if not start_time or not end_time or not days:
-                raise ValueError("Missing required fields")
-
-            if system == "CH":
-                setpoint = float(p.get("setpoint"))
-                warmup = 1 if p.get("warmup") else 0
-            else:
-                setpoint = None
-                warmup = 0
-
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("""
-                        UPDATE schedule_entries
-                        SET schedule_set_name = ?,
-                            start_time        = ?,
-                            end_time          = ?,
-                            days              = ?,
-                            setpoint          = ?,
-                            warmup            = ?,
-                            note              = ?,
-                            enabled           = ?
-                        WHERE id = ?
-                          AND system = ?
-                        """,
-                        (schedule_set_name, start_time, end_time, days, setpoint, warmup, note, enabled, program_id,
-                         system))
-            changed = cur.rowcount
-            self.conn.commit()
-
-            if changed < 1:
-                resp = Message(
-                    "db",
-                    "update_program_result",
-                    {"ok": False, "error": "Program not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-            else:
-                resp = Message(
-                    "db",
-                    "update_program_result",
-                    {"ok": True, "id": program_id},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-
-        except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "update_program_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
-
-        self._reply_to_source(
-            msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-        )
-
-    def handle_delete_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
-        p = msg.payload or {}
-
-        try:
-            program_id = int(p.get("id"))
-
-            system = str(p.get("system") or "").strip().upper()
-
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("DELETE FROM schedule_entries WHERE id = ? AND system = ?", (program_id,system,))
-            changed = cur.rowcount
-            self.conn.commit()
-
-            if changed < 1:
-                resp = Message(
-                    "db",
-                    "delete_program_result",
-                    {"ok": False, "error": "Program not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-            else:
-                resp = Message(
-                    "db",
-                    "delete_program_result",
-                    {"ok": True, "id": program_id},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-
-        except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "delete_program_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
-
-        self._reply_to_source(
-            msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-        )
-
-    def handle_copy_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
-        p = msg.payload or {}
-
-        try:
-            program_id = int(p.get("id"))
-
-            system = str(p.get("system") or "").strip().upper()
-
-            cur = self.conn.cursor()
-            cur.execute("""
+            row = self._fetch_one(
+                """
                 SELECT schedule_set_name, system, start_time, end_time, days, setpoint, warmup, note, enabled
                 FROM schedule_entries
                 WHERE id = ? AND system = ?
                 LIMIT 1
-            """, (program_id,system,))
-            row = cur.fetchone()
+                """,
+                (program_id, system)
+            )
 
             if not row:
-                resp = Message(
-                    "db",
-                    "copy_program_result",
-                    {"ok": False, "error": "Program not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
+                resp = self._error_response(msg, "copy_program_result", "Program not found")
             else:
-                cur.execute("BEGIN IMMEDIATE")
-                cur.execute("""
-                    INSERT INTO schedule_entries
-                    (schedule_set_name, system, start_time, end_time, days, setpoint, warmup, note, enabled)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, row)
-                new_id = cur.lastrowid
-                self.conn.commit()
-
-                resp = Message(
-                    "db",
-                    "copy_program_result",
-                    {"ok": True, "id": new_id},
-                    target=msg.source,
-                    request_id=msg.request_id
+                new_id = self._insert_row(
+                    "schedule_entries",
+                    "schedule_set_name, system, start_time, end_time, days, setpoint, warmup, note, enabled",
+                    row
                 )
+                resp = self._ok_id_response(msg, "copy_program_result", new_id)
 
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "copy_program_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            self._rollback_quiet()
+            resp = self._error_response(msg, "copy_program_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_get_active_ch_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                                     web_ctrl_queue):
+    def handle_get_active_ch_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
+                                     relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
         try:
             now_epoch = float((msg.payload or {}).get("now_epoch", time.time()))
         except Exception:
             now_epoch = time.time()
 
         try:
-            from datetime import datetime
-            dt = datetime.fromtimestamp(now_epoch)
-            weekday = dt.weekday()   # 0 = Mon
-            hhmm = dt.strftime("%H:%M")
+            dt_now = datetime.datetime.fromtimestamp(now_epoch)
+            weekday = dt_now.weekday()  # 0 = Mon
+            yesterday = (weekday - 1) % 7
+            hhmm = dt_now.strftime("%H:%M")
 
             cur = self.conn.cursor()
             cur.execute("""
-                        SELECT id,
-                               schedule_set_name,
-                               system,
-                               start_time,
-                               end_time,
-                               days,
-                               setpoint,
-                               warmup,
-                               note,
-                               enabled
-                        FROM schedule_entries
-                        WHERE enabled = 1
-                          AND system = 'CH'
-                          AND instr(days, ?) > 0
-                          AND start_time <= ?
-                          AND ? < end_time
-                        ORDER BY start_time ASC, id ASC
-                        LIMIT 1
-                        """, (str(weekday), hhmm, hhmm))
+                SELECT id,
+                       schedule_set_name,
+                       system,
+                       start_time,
+                       end_time,
+                       days,
+                       setpoint,
+                       warmup,
+                       note,
+                       enabled
+                FROM schedule_entries
+                WHERE enabled = 1
+                  AND system = 'CH'
+                  AND (
+                        (
+                            instr(days, ?) > 0
+                            AND start_time < end_time
+                            AND start_time <= ?
+                            AND ? < end_time
+                        )
+                        OR
+                        (
+                            instr(days, ?) > 0
+                            AND start_time >= end_time
+                            AND ? >= start_time
+                        )
+                        OR
+                        (
+                            instr(days, ?) > 0
+                            AND start_time >= end_time
+                            AND ? < end_time
+                        )
+                      )
+                ORDER BY start_time ASC, id ASC
+                LIMIT 1
+            """, (
+                str(weekday), hhmm, hhmm,
+                str(weekday), hhmm,
+                str(yesterday), hhmm
+            ))
 
             row = cur.fetchone()
 
             if not row:
-                resp = Message(
-                    "db",
-                    "active_ch_program_result",
-                    {"ok": True, "item": None},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
+                resp = self._make_response(msg, "active_ch_program_result", {
+                    "ok": True,
+                    "item": None
+                })
             else:
-                resp = Message(
-                    "db",
-                    "active_ch_program_result",
-                    {
-                        "ok": True,
-                        "item": {
-                            "id": row[0],
-                            "schedule_set_name": row[1],
-                            "system": row[2],
-                            "start_time": row[3],
-                            "end_time": row[4],
-                            "days": row[5],
-                            "setpoint": row[6],
-                            "warmup": row[7],
-                            "note": row[8],
-                            "enabled": row[9],
-                        }
-                    },
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
+                resp = self._make_response(msg, "active_ch_program_result", {
+                    "ok": True,
+                    "item": self._row_to_dict(self.PROGRAM_COLUMNS, row)
+                })
 
         except Exception as e:
-            resp = Message(
-                "db",
-                "active_ch_program_result",
-                {"ok": False, "error": str(e), "item": None},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "active_ch_program_result", {
+                "ok": False,
+                "error": str(e),
+                "item": None
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_update_program_setpoint(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                                       web_ctrl_queue):
+    def handle_update_program_setpoint(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                       ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -782,16 +864,8 @@ class DBWorker(object):
         except Exception:
             program_id = None
 
-        setpoint = p.get("setpoint")
-
         if program_id is None:
-            resp = Message(
-                "db",
-                "update_program_setpoint_result",
-                {"ok": False, "error": "Invalid program id"},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._error_response(msg, "update_program_setpoint_result", "Invalid program id")
             self._reply_to_source(
                 msg, resp,
                 engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
@@ -799,15 +873,9 @@ class DBWorker(object):
             return
 
         try:
-            setpoint = float(setpoint)
+            setpoint = float(p.get("setpoint"))
         except Exception:
-            resp = Message(
-                "db",
-                "update_program_setpoint_result",
-                {"ok": False, "error": "Invalid setpoint"},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._error_response(msg, "update_program_setpoint_result", "Invalid setpoint")
             self._reply_to_source(
                 msg, resp,
                 engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
@@ -816,50 +884,40 @@ class DBWorker(object):
 
         try:
             cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
+            self._begin()
             cur.execute("""
-                        UPDATE schedule_entries
-                        SET setpoint = ?
-                        WHERE id = ?
-                        """, (setpoint, program_id))
+                UPDATE schedule_entries
+                SET setpoint = ?
+                WHERE id = ?
+            """, (setpoint, program_id))
 
             changed = cur.rowcount
-            self.conn.commit()
+            self._commit()
 
             if changed < 1:
-                resp = Message(
-                    "db",
+                resp = self._error_response(
+                    msg,
                     "update_program_setpoint_result",
-                    {"ok": False, "error": "Program not found", "id": program_id},
-                    target=msg.source,
-                    request_id=msg.request_id
+                    "Program not found",
+                    {"id": program_id}
                 )
             else:
                 ts_epoch = time.time()
                 ts_text = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(ts_epoch))
-                self.state_buf.append((ts_epoch, ts_text, "PROGRAM", "Program %s setpoint=%.1f" % (program_id, setpoint)))
+                self.state_buf.append(
+                    (ts_epoch, ts_text, "PROGRAM", "Program %s setpoint=%.1f" % (program_id, setpoint))
+                )
 
-                resp = Message(
-                    "db",
+                resp = self._ok_id_response(
+                    msg,
                     "update_program_setpoint_result",
-                    {"ok": True, "id": program_id, "setpoint": setpoint},
-                    target=msg.source,
-                    request_id=msg.request_id
+                    program_id,
+                    {"setpoint": setpoint}
                 )
 
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "update_program_setpoint_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            self._rollback_quiet()
+            resp = self._error_response(msg, "update_program_setpoint_result", str(e))
 
         self._reply_to_source(
             msg, resp,
@@ -874,9 +932,15 @@ class DBWorker(object):
             except Exception:
                 pass
 
-    def handle_set_setting(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
-        key = msg.payload.get("key")
-        value = msg.payload.get("value")
+    def handle_set_setting(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
+                           web_ctrl_queue):
+        p = msg.payload or {}
+        key = p.get("key")
+        value = p.get("value")
+
+        if not key:
+            print("[DB] WARNING: set_setting missing key")
+            return
 
         ok, final_val = self._validate_or_default(key, value)
         self.settings[key] = final_val
@@ -884,11 +948,11 @@ class DBWorker(object):
 
         self.flush_settings()
 
-        # Push live update (DB push model)
-        self._push_setting_changed(key, final_val, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                   ui_ctrl_queue, web_ctrl_queue)
+        self._push_setting_changed(
+            key, final_val,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
 
-        # Audit buffered
         ts_epoch = time.time()
         ts_text = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(ts_epoch))
         state_msg = "Setting %s=%s" % (key, final_val)
@@ -897,7 +961,7 @@ class DBWorker(object):
         self.state_buf.append((ts_epoch, ts_text, "SETTINGS", state_msg))
 
     def handle_temperature_log(self, msg):
-        data = msg.payload
+        data = msg.payload or {}
         ts_epoch = data.get("timestamp", time.time())
         ts_text = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(ts_epoch))
         source = msg.source
@@ -909,7 +973,7 @@ class DBWorker(object):
         self.temp_buf.append((ts_epoch, ts_text, source, value))
 
     def handle_state_change(self, msg):
-        data = msg.payload
+        data = msg.payload or {}
         ts_epoch = data.get("timestamp", time.time())
         ts_text = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(ts_epoch))
         system = data.get("system", "SYSTEM")
@@ -937,96 +1001,62 @@ class DBWorker(object):
 
         cur = self.conn.cursor()
         try:
-            cur.execute("BEGIN IMMEDIATE")
+            self._begin()
             cur.execute("DELETE FROM away_periods WHERE enabled=1 AND end_ts_epoch < ?", (now_epoch,))
             cur.execute("DELETE FROM special_periods WHERE enabled=1 AND end_ts_epoch < ?", (now_epoch,))
-            self.conn.commit()
+            self._commit()
         except Exception:
-            self.conn.rollback()
+            self._rollback_quiet()
             # keep quiet-ish; or log if you prefer
 
-    def handle_get_state_log(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_get_state_log(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                             ui_ctrl_queue, web_ctrl_queue):
         try:
             req_date = (msg.payload or {}).get("date")
-            start_epoch, end_epoch, day_used = self._get_day_range_epoch(req_date)
-
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT ts_epoch, ts, system, state
-                FROM state_log
-                WHERE ts_epoch >= ? AND ts_epoch < ?
-                ORDER BY ts_epoch DESC
-            """, (start_epoch, end_epoch))
-
-            rows = cur.fetchall()
-            items = []
-            for row in rows:
-                items.append({
-                    "ts_epoch": row[0],
-                    "ts": row[1],
-                    "system": row[2],
-                    "state": row[3]
-                })
-
-            resp = Message(
-                "db",
-                "state_log_result",
-                {"ok": True, "date": day_used, "items": items},
-                target=msg.source,
-                request_id=msg.request_id
+            day_used, items = self._get_log_items_for_day(
+                "state_log",
+                self.STATE_LOG_COLUMNS,
+                req_date
             )
+
+            resp = self._make_response(msg, "state_log_result", {
+                "ok": True,
+                "date": day_used,
+                "items": items
+            })
         except Exception as e:
-            resp = Message(
-                "db",
-                "state_log_result",
-                {"ok": False, "error": str(e), "items": []},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "state_log_result", {
+                "ok": False,
+                "error": str(e),
+                "items": []
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_get_temperature_log(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_get_temperature_log(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                   ui_ctrl_queue, web_ctrl_queue):
         try:
             req_date = (msg.payload or {}).get("date")
-            start_epoch, end_epoch, day_used = self._get_day_range_epoch(req_date)
-
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT ts_epoch, ts, source, value
-                FROM temperature_log
-                WHERE ts_epoch >= ? AND ts_epoch < ?
-                ORDER BY ts_epoch DESC
-            """, (start_epoch, end_epoch))
-
-            rows = cur.fetchall()
-            items = []
-            for row in rows:
-                items.append({
-                    "ts_epoch": row[0],
-                    "ts": row[1],
-                    "source": row[2],
-                    "value": row[3]
-                })
-
-            resp = Message(
-                "db",
-                "temperature_log_result",
-                {"ok": True, "date": day_used, "items": items},
-                target=msg.source,
-                request_id=msg.request_id
+            day_used, items = self._get_log_items_for_day(
+                "temperature_log",
+                self.TEMPERATURE_LOG_COLUMNS,
+                req_date
             )
+
+            resp = self._make_response(msg, "temperature_log_result", {
+                "ok": True,
+                "date": day_used,
+                "items": items
+            })
         except Exception as e:
-            resp = Message(
-                "db",
-                "temperature_log_result",
-                {"ok": False, "error": str(e), "items": []},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "temperature_log_result", {
+                "ok": False,
+                "error": str(e),
+                "items": []
+            })
 
         self._reply_to_source(
             msg, resp,
@@ -1056,197 +1086,102 @@ class DBWorker(object):
         if end_ts_epoch <= start_ts_epoch:
             raise ValueError("End must be after start")
 
-    def _find_overlapping_special(self, start_ts_epoch, end_ts_epoch, systems, exclude_id=None):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT id, start_ts_epoch, end_ts_epoch, systems
-            FROM special_periods
-            WHERE enabled = 1
-        """)
-        rows = cur.fetchall()
-
-        for row in rows:
-            row_id = row[0]
-            row_start = float(row[1])
-            row_end = float(row[2])
-            row_systems = row[3]
-
-            if exclude_id is not None and row_id == exclude_id:
-                continue
-
-            if not self._systems_overlap(systems, row_systems):
-                continue
-
-            if start_ts_epoch < row_end and end_ts_epoch > row_start:
-                return row_id
-
-        return None
-
-    def handle_get_schedule_sets(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                                 web_ctrl_queue):
+    def handle_get_schedule_sets(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                 ui_ctrl_queue, web_ctrl_queue):
         try:
-            cur = self.conn.cursor()
-            cur.execute("""
-                        SELECT name, enabled, note
-                        FROM schedule_sets
-                        ORDER BY name ASC
-                        """)
-            rows = cur.fetchall()
-
-            items = []
-            for row in rows:
-                items.append({
-                    "name": row[0],
-                    "enabled": row[1],
-                    "note": row[2],
-                })
-
-            resp = Message(
-                "db",
-                "schedule_sets_result",
-                {"ok": True, "items": items},
-                target=msg.source,
-                request_id=msg.request_id
+            items = self._fetch_all_dicts(
+                self.SCHEDULE_SET_COLUMNS,
+                """
+                SELECT name, enabled, note
+                FROM schedule_sets
+                ORDER BY name ASC
+                """
             )
+
+            resp = self._make_response(msg, "schedule_sets_result", {
+                "ok": True,
+                "items": items
+            })
         except Exception as e:
-            resp = Message(
-                "db",
-                "schedule_sets_result",
-                {"ok": False, "error": str(e), "items": []},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "schedule_sets_result", {
+                "ok": False,
+                "error": str(e),
+                "items": []
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def _find_overlapping_holiday(self, start_ts_epoch, end_ts_epoch, systems, exclude_id=None):
-        cur = self.conn.cursor()
-        cur.execute("""
-                    SELECT id, start_ts_epoch, end_ts_epoch, systems
-                    FROM away_periods
-                    WHERE enabled = 1
-                    """)
-        rows = cur.fetchall()
-
-        for row in rows:
-            row_id = row[0]
-            row_start = float(row[1])
-            row_end = float(row[2])
-            row_systems = row[3]
-
-            if exclude_id is not None and row_id == exclude_id:
-                continue
-
-            if not self._systems_overlap(systems, row_systems):
-                continue
-
-            if start_ts_epoch < row_end and end_ts_epoch > row_start:
-                return row_id
-
-        return None
-
-    def handle_get_holidays(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_get_holidays(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
+                            relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
         try:
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note
+            items = self._fetch_all_dicts(
+                self.HOLIDAY_COLUMNS,
+                """
+                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch,
+                       end_ts_text, systems, enabled, note
                 FROM away_periods
                 ORDER BY start_ts_epoch DESC, id DESC
-            """)
-            rows = cur.fetchall()
-
-            items = []
-            for row in rows:
-                items.append({
-                    "id": row[0],
-                    "start_ts_epoch": row[1],
-                    "start_ts_text": row[2],
-                    "end_ts_epoch": row[3],
-                    "end_ts_text": row[4],
-                    "systems": row[5],
-                    "enabled": row[6],
-                    "note": row[7],
-                })
-
-            resp = Message(
-                "db",
-                "holidays_result",
-                {"ok": True, "items": items},
-                target=msg.source,
-                request_id=msg.request_id
+                """
             )
+
+            resp = self._make_response(msg, "holidays_result", {
+                "ok": True,
+                "items": items
+            })
         except Exception as e:
-            resp = Message(
-                "db",
-                "holidays_result",
-                {"ok": False, "error": str(e), "items": []},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "holidays_result", {
+                "ok": False,
+                "error": str(e),
+                "items": []
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_get_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_get_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                           ui_ctrl_queue, web_ctrl_queue):
         try:
             holiday_id = int((msg.payload or {}).get("id"))
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note
+            item = self._fetch_one_dict(
+                self.HOLIDAY_COLUMNS,
+                """
+                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch,
+                       end_ts_text, systems, enabled, note
                 FROM away_periods
                 WHERE id = ?
                 LIMIT 1
-            """, (holiday_id,))
-            row = cur.fetchone()
-
-            if not row:
-                resp = Message(
-                    "db",
-                    "holiday_result",
-                    {"ok": False, "error": "Holiday not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-            else:
-                resp = Message(
-                    "db",
-                    "holiday_result",
-                    {
-                        "ok": True,
-                        "item": {
-                            "id": row[0],
-                            "start_ts_epoch": row[1],
-                            "start_ts_text": row[2],
-                            "end_ts_epoch": row[3],
-                            "end_ts_text": row[4],
-                            "systems": row[5],
-                            "enabled": row[6],
-                            "note": row[7],
-                        }
-                    },
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-        except Exception as e:
-            resp = Message(
-                "db",
-                "holiday_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
+                """,
+                (holiday_id,)
             )
+
+            if item is None:
+                resp = self._make_response(msg, "holiday_result", {
+                    "ok": False,
+                    "error": "Holiday not found"
+                })
+            else:
+                resp = self._make_response(msg, "holiday_result", {
+                    "ok": True,
+                    "item": item
+                })
+        except Exception as e:
+            resp = self._make_response(msg, "holiday_result", {
+                "ok": False,
+                "error": str(e)
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_create_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_create_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                              ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1263,47 +1198,32 @@ class DBWorker(object):
             if not systems:
                 raise ValueError("Systems required")
 
-            overlap_id = self._find_overlapping_holiday(start_ts_epoch, end_ts_epoch, systems, exclude_id=None)
-            if overlap_id is not None:
-                raise ValueError("Overlaps existing holiday #%s" % overlap_id)
+            if enabled:
+                overlap_id = self._find_overlapping_holiday(
+                    start_ts_epoch, end_ts_epoch, systems
+                )
+                if overlap_id is not None:
+                    raise ValueError("Overlaps existing holiday #%s" % overlap_id)
 
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("""
-                INSERT INTO away_periods
+            new_id = self._insert_row(
+                "away_periods",
+                "start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note",
                 (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note))
-            new_id = cur.lastrowid
-            self.conn.commit()
-
-            resp = Message(
-                "db",
-                "create_holiday_result",
-                {"ok": True, "id": new_id},
-                target=msg.source,
-                request_id=msg.request_id
             )
+
+            resp = self._ok_id_response(msg, "create_holiday_result", new_id)
+
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "create_holiday_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            self._rollback_quiet()
+            resp = self._error_response(msg, "create_holiday_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_update_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_update_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                              ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1321,280 +1241,157 @@ class DBWorker(object):
             if not systems:
                 raise ValueError("Systems required")
 
-            overlap_id = self._find_overlapping_holiday(start_ts_epoch, end_ts_epoch, systems, exclude_id=holiday_id)
-            if overlap_id is not None:
-                raise ValueError("Overlaps existing holiday #%s" % overlap_id)
+            if enabled:
+                overlap_id = self._find_overlapping_holiday(
+                    start_ts_epoch, end_ts_epoch, systems, exclude_id=holiday_id
+                )
+                if overlap_id is not None:
+                    raise ValueError("Overlaps existing holiday #%s" % overlap_id)
 
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("""
-                UPDATE away_periods
-                SET start_ts_epoch = ?,
-                    start_ts_text = ?,
-                    end_ts_epoch = ?,
-                    end_ts_text = ?,
-                    systems = ?,
-                    enabled = ?,
-                    note = ?
+            changed = self._update_row_by_id(
+                "away_periods",
+                "start_ts_epoch=?, start_ts_text=?, end_ts_epoch=?, end_ts_text=?, systems=?, enabled=?, note=?",
+                (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note),
+                holiday_id
+            )
+
+            if changed < 1:
+                resp = self._error_response(msg, "update_holiday_result", "Holiday not found")
+            else:
+                resp = self._ok_id_response(msg, "update_holiday_result", holiday_id)
+
+        except Exception as e:
+            self._rollback_quiet()
+            resp = self._error_response(msg, "update_holiday_result", str(e))
+
+        self._reply_to_source(
+            msg, resp,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
+
+    def handle_delete_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                              ui_ctrl_queue, web_ctrl_queue):
+        try:
+            holiday_id = int((msg.payload or {}).get("id"))
+
+            changed = self._delete_by_id("away_periods", holiday_id)
+
+            if changed < 1:
+                resp = self._error_response(msg, "delete_holiday_result", "Holiday not found")
+            else:
+                resp = self._ok_id_response(msg, "delete_holiday_result", holiday_id)
+
+        except Exception as e:
+            self._rollback_quiet()
+            resp = self._error_response(msg, "delete_holiday_result", str(e))
+
+        self._reply_to_source(
+            msg, resp,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
+
+    def handle_copy_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                            ui_ctrl_queue, web_ctrl_queue):
+        try:
+            holiday_id = int((msg.payload or {}).get("id"))
+
+            row = self._fetch_one(
+                """
+                SELECT start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, note
+                FROM away_periods
                 WHERE id = ?
-            """, (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note, holiday_id))
-            changed = cur.rowcount
-            self.conn.commit()
-
-            if changed < 1:
-                resp = Message(
-                    "db",
-                    "update_holiday_result",
-                    {"ok": False, "error": "Holiday not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-            else:
-                resp = Message(
-                    "db",
-                    "update_holiday_result",
-                    {"ok": True, "id": holiday_id},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-        except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "update_holiday_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
+                LIMIT 1
+                """,
+                (holiday_id,)
             )
-
-        self._reply_to_source(
-            msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-        )
-
-    def handle_delete_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
-        try:
-            holiday_id = int((msg.payload or {}).get("id"))
-
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("DELETE FROM away_periods WHERE id = ?", (holiday_id,))
-            changed = cur.rowcount
-            self.conn.commit()
-
-            if changed < 1:
-                resp = Message(
-                    "db",
-                    "delete_holiday_result",
-                    {"ok": False, "error": "Holiday not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-            else:
-                resp = Message(
-                    "db",
-                    "delete_holiday_result",
-                    {"ok": True, "id": holiday_id},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-        except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "delete_holiday_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
-
-        self._reply_to_source(
-            msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-        )
-
-    def handle_copy_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                            web_ctrl_queue):
-        try:
-            holiday_id = int((msg.payload or {}).get("id"))
-
-            cur = self.conn.cursor()
-            cur.execute("""
-                        SELECT start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note
-                        FROM away_periods
-                        WHERE id = ? LIMIT 1
-                        """, (holiday_id,))
-            row = cur.fetchone()
 
             if not row:
-                resp = Message(
-                    "db",
-                    "copy_holiday_result",
-                    {"ok": False, "error": "Holiday not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
+                resp = self._error_response(msg, "copy_holiday_result", "Holiday not found")
             else:
-                overlap_id = self._find_overlapping_holiday(
-                    float(row[0]), float(row[2]), row[4], exclude_id=None
+                new_id = self._insert_row(
+                    "away_periods",
+                    "start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note",
+                    (row[0], row[1], row[2], row[3], row[4], 0, row[5])
                 )
-
-                if overlap_id is not None:
-                    resp = Message(
-                        "db",
-                        "copy_holiday_result",
-                        {"ok": False, "error": "Copied holiday would overlap existing holiday #%s" % overlap_id},
-                        target=msg.source,
-                        request_id=msg.request_id
-                    )
-                else:
-                    cur.execute("BEGIN IMMEDIATE")
-                    cur.execute("""
-                                INSERT INTO away_periods
-                                (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, enabled, note)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                                """, row)
-                    new_id = cur.lastrowid
-                    self.conn.commit()
-
-                    resp = Message(
-                        "db",
-                        "copy_holiday_result",
-                        {"ok": True, "id": new_id},
-                        target=msg.source,
-                        request_id=msg.request_id
-                    )
+                resp = self._ok_id_response(msg, "copy_holiday_result", new_id)
 
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "copy_holiday_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            self._rollback_quiet()
+            resp = self._error_response(msg, "copy_holiday_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_get_special_periods(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_get_special_periods(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                   ui_ctrl_queue, web_ctrl_queue):
         try:
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text,
-                       systems, schedule_set_name, enabled, note
+            items = self._fetch_all_dicts(
+                self.SPECIAL_PERIOD_COLUMNS,
+                """
+                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch,
+                       end_ts_text, systems, schedule_set_name, enabled, note
                 FROM special_periods
                 ORDER BY start_ts_epoch DESC, id DESC
-            """)
-            rows = cur.fetchall()
-
-            items = []
-            for row in rows:
-                items.append({
-                    "id": row[0],
-                    "start_ts_epoch": row[1],
-                    "start_ts_text": row[2],
-                    "end_ts_epoch": row[3],
-                    "end_ts_text": row[4],
-                    "systems": row[5],
-                    "schedule_set_name": row[6],
-                    "enabled": row[7],
-                    "note": row[8],
-                })
-
-            resp = Message(
-                "db",
-                "special_periods_result",
-                {"ok": True, "items": items},
-                target=msg.source,
-                request_id=msg.request_id
+                """
             )
+
+            resp = self._make_response(msg, "special_periods_result", {
+                "ok": True,
+                "items": items
+            })
         except Exception as e:
-            resp = Message(
-                "db",
-                "special_periods_result",
-                {"ok": False, "error": str(e), "items": []},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "special_periods_result", {
+                "ok": False,
+                "error": str(e),
+                "items": []
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_get_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_get_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                  ui_ctrl_queue, web_ctrl_queue):
         try:
             item_id = int((msg.payload or {}).get("id"))
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text,
-                       systems, schedule_set_name, enabled, note
+            item = self._fetch_one_dict(
+                self.SPECIAL_PERIOD_COLUMNS,
+                """
+                SELECT id, start_ts_epoch, start_ts_text, end_ts_epoch,
+                       end_ts_text, systems, schedule_set_name, enabled, note
                 FROM special_periods
                 WHERE id = ?
                 LIMIT 1
-            """, (item_id,))
-            row = cur.fetchone()
-
-            if not row:
-                resp = Message(
-                    "db",
-                    "special_period_result",
-                    {"ok": False, "error": "Special period not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-            else:
-                resp = Message(
-                    "db",
-                    "special_period_result",
-                    {
-                        "ok": True,
-                        "item": {
-                            "id": row[0],
-                            "start_ts_epoch": row[1],
-                            "start_ts_text": row[2],
-                            "end_ts_epoch": row[3],
-                            "end_ts_text": row[4],
-                            "systems": row[5],
-                            "schedule_set_name": row[6],
-                            "enabled": row[7],
-                            "note": row[8],
-                        }
-                    },
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-        except Exception as e:
-            resp = Message(
-                "db",
-                "special_period_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
+                """,
+                (item_id,)
             )
+
+            if item is None:
+                resp = self._make_response(msg, "special_period_result", {
+                    "ok": False,
+                    "error": "Special period not found"
+                })
+            else:
+                resp = self._make_response(msg, "special_period_result", {
+                    "ok": True,
+                    "item": item
+                })
+        except Exception as e:
+            resp = self._make_response(msg, "special_period_result", {
+                "ok": False,
+                "error": str(e)
+            })
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_create_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_create_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                     ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1616,57 +1413,35 @@ class DBWorker(object):
             if schedule_set_name == "NORMAL":
                 raise ValueError("NORMAL cannot be used as a special schedule")
 
-            overlap_id = self._find_overlapping_special(start_ts_epoch, end_ts_epoch, systems, exclude_id=None)
-            if overlap_id is not None:
-                raise ValueError("Overlaps existing special period #%s" % overlap_id)
-
-            cur = self.conn.cursor()
-            cur.execute("SELECT name FROM schedule_sets WHERE name = ?", (schedule_set_name,))
-            if cur.fetchone() is None:
-                cur.execute("BEGIN IMMEDIATE")
-                cur.execute(
-                    "INSERT INTO schedule_sets (name, enabled, note) VALUES (?, ?, ?)",
-                    (schedule_set_name, 1, "")
+            if enabled:
+                overlap_id = self._find_overlapping_special(
+                    start_ts_epoch, end_ts_epoch, systems, exclude_id=None
                 )
-                self.conn.commit()
+                if overlap_id is not None:
+                    raise ValueError("Overlaps existing special period #%s" % overlap_id)
 
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("""
-                INSERT INTO special_periods
-                (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, schedule_set_name, enabled, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, schedule_set_name, enabled, note))
-            new_id = cur.lastrowid
-            self.conn.commit()
+            self._ensure_schedule_set_exists(schedule_set_name)
 
-            resp = Message(
-                "db",
-                "create_special_period_result",
-                {"ok": True, "id": new_id},
-                target=msg.source,
-                request_id=msg.request_id
+            new_id = self._insert_row(
+                "special_periods",
+                "start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, schedule_set_name, enabled, note",
+                (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text,
+                 systems, schedule_set_name, enabled, note)
             )
+
+            resp = self._ok_id_response(msg, "create_special_period_result", new_id)
+
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-
-            resp = Message(
-                "db",
-                "create_special_period_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            self._rollback_quiet()
+            resp = self._error_response(msg, "create_special_period_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_update_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_update_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                     ui_ctrl_queue, web_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1689,179 +1464,98 @@ class DBWorker(object):
             if schedule_set_name == "NORMAL":
                 raise ValueError("NORMAL cannot be used as a special schedule")
 
-            overlap_id = self._find_overlapping_special(start_ts_epoch, end_ts_epoch, systems, exclude_id=item_id)
-            if overlap_id is not None:
-                raise ValueError("Overlaps existing special period #%s" % overlap_id)
-
-            cur = self.conn.cursor()
-            cur.execute("SELECT name FROM schedule_sets WHERE name = ?", (schedule_set_name,))
-            if cur.fetchone() is None:
-                cur.execute("BEGIN IMMEDIATE")
-                cur.execute(
-                    "INSERT INTO schedule_sets (name, enabled, note) VALUES (?, ?, ?)",
-                    (schedule_set_name, 1, "")
+            if enabled:
+                overlap_id = self._find_overlapping_special(
+                    start_ts_epoch, end_ts_epoch, systems, exclude_id=item_id
                 )
-                self.conn.commit()
+                if overlap_id is not None:
+                    raise ValueError("Overlaps existing special period #%s" % overlap_id)
 
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("""
-                UPDATE special_periods
-                SET start_ts_epoch = ?,
-                    start_ts_text = ?,
-                    end_ts_epoch = ?,
-                    end_ts_text = ?,
-                    systems = ?,
-                    schedule_set_name = ?,
-                    enabled = ?,
-                    note = ?
-                WHERE id = ?
-            """, (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, schedule_set_name, enabled, note, item_id))
-            changed = cur.rowcount
-            self.conn.commit()
+            self._ensure_schedule_set_exists(schedule_set_name)
+
+            changed = self._update_row_by_id(
+                "special_periods",
+                "start_ts_epoch=?, start_ts_text=?, end_ts_epoch=?, end_ts_text=?, systems=?, schedule_set_name=?, enabled=?, note=?",
+                (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text,
+                 systems, schedule_set_name, enabled, note),
+                item_id
+            )
 
             if changed < 1:
-                resp = Message(
-                    "db",
-                    "update_special_period_result",
-                    {"ok": False, "error": "Special period not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
+                resp = self._error_response(msg, "update_special_period_result", "Special period not found")
             else:
-                resp = Message(
-                    "db",
-                    "update_special_period_result",
-                    {"ok": True, "id": item_id},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-        except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
+                resp = self._ok_id_response(msg, "update_special_period_result", item_id)
 
-            resp = Message(
-                "db",
-                "update_special_period_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+        except Exception as e:
+            self._rollback_quiet()
+            resp = self._error_response(msg, "update_special_period_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_delete_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_delete_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                     ui_ctrl_queue, web_ctrl_queue):
         try:
             item_id = int((msg.payload or {}).get("id"))
 
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur.execute("DELETE FROM special_periods WHERE id = ?", (item_id,))
-            changed = cur.rowcount
-            self.conn.commit()
+            changed = self._delete_by_id("special_periods", item_id)
 
             if changed < 1:
-                resp = Message(
-                    "db",
-                    "delete_special_period_result",
-                    {"ok": False, "error": "Special period not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
+                resp = self._error_response(msg, "delete_special_period_result", "Special period not found")
             else:
-                resp = Message(
-                    "db",
-                    "delete_special_period_result",
-                    {"ok": True, "id": item_id},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
-        except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
+                resp = self._ok_id_response(msg, "delete_special_period_result", item_id)
 
-            resp = Message(
-                "db",
-                "delete_special_period_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+        except Exception as e:
+            self._rollback_quiet()
+            resp = self._error_response(msg, "delete_special_period_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-    def handle_copy_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def handle_copy_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                                   ui_ctrl_queue, web_ctrl_queue):
         try:
             item_id = int((msg.payload or {}).get("id"))
 
-            cur = self.conn.cursor()
-            cur.execute("""
+            row = self._fetch_one(
+                """
                 SELECT start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text,
-                       systems, schedule_set_name, enabled, note
+                       systems, schedule_set_name, note
                 FROM special_periods
                 WHERE id = ?
                 LIMIT 1
-            """, (item_id,))
-            row = cur.fetchone()
+                """,
+                (item_id,)
+            )
 
             if not row:
-                resp = Message(
-                    "db",
-                    "copy_special_period_result",
-                    {"ok": False, "error": "Special period not found"},
-                    target=msg.source,
-                    request_id=msg.request_id
-                )
+                resp = self._error_response(msg, "copy_special_period_result", "Special period not found")
             else:
-                overlap_id = self._find_overlapping_special(float(row[0]), float(row[2]), row[4], exclude_id=None)
-                if overlap_id is not None:
-                    resp = Message(
-                        "db",
-                        "copy_special_period_result",
-                        {"ok": False, "error": "Copied period would overlap existing special period #%s" % overlap_id},
-                        target=msg.source,
-                        request_id=msg.request_id
-                    )
-                else:
-                    cur.execute("BEGIN IMMEDIATE")
-                    cur.execute("""
-                        INSERT INTO special_periods
-                        (start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, schedule_set_name, enabled, note)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, row)
-                    new_id = cur.lastrowid
-                    self.conn.commit()
+                new_id = self._insert_row(
+                    "special_periods",
+                    "start_ts_epoch, start_ts_text, end_ts_epoch, end_ts_text, systems, schedule_set_name, enabled, note",
+                    (row[0], row[1], row[2], row[3], row[4], row[5], 0, row[6])
+                )
+                resp = self._ok_id_response(msg, "copy_special_period_result", new_id)
 
-                    resp = Message(
-                        "db",
-                        "copy_special_period_result",
-                        {"ok": True, "id": new_id},
-                        target=msg.source,
-                        request_id=msg.request_id
-                    )
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
+            self._rollback_quiet()
+            resp = self._error_response(msg, "copy_special_period_result", str(e))
 
-            resp = Message(
-                "db",
-                "copy_special_period_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+        self._reply_to_source(
+            msg, resp,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
+
+    def handle_request_settings_snapshot(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
+                                         relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+        resp = self._make_response(msg, "settings_snapshot", {
+            "values": dict(self.settings)
+        })
 
         self._reply_to_source(
             msg, resp,
@@ -1875,13 +1569,7 @@ class DBWorker(object):
         action = str(p.get("action") or "").strip().lower()
 
         if msg.source not in ("ui", "web"):
-            resp = Message(
-                "db",
-                "system_action_result",
-                {"ok": False, "error": "Invalid source"},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._error_response(msg, "system_action_result", "Invalid source")
             self._reply_to_source(
                 msg, resp,
                 engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
@@ -1889,13 +1577,7 @@ class DBWorker(object):
             return
 
         if action not in ("restart_dwellpi", "reboot_pi"):
-            resp = Message(
-                "db",
-                "system_action_result",
-                {"ok": False, "error": "Invalid action"},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._error_response(msg, "system_action_result", "Invalid action")
             self._reply_to_source(
                 msg, resp,
                 engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
@@ -1913,29 +1595,21 @@ class DBWorker(object):
                 request_id=msg.request_id
             ))
 
-            resp = Message(
-                "db",
-                "system_action_result",
-                {"ok": True, "action": action, "status": "accepted"},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._make_response(msg, "system_action_result", {
+                "ok": True,
+                "action": action,
+                "status": "accepted"
+            })
         except Exception as e:
-            resp = Message(
-                "db",
-                "system_action_result",
-                {"ok": False, "error": str(e)},
-                target=msg.source,
-                request_id=msg.request_id
-            )
+            resp = self._error_response(msg, "system_action_result", str(e))
 
         self._reply_to_source(
             msg, resp,
             engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
         )
 
-
-    def run(self, queue, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, supervisor_queue, shutdown_event):
+    def run(self, queue, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, supervisor_queue, shutdown_event):
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -1943,7 +1617,9 @@ class DBWorker(object):
         self.load_settings_cache()
 
         # Push snapshot FIRST so engine/sensor/relay/ui/web can start without RPC
-        self.send_settings_snapshot(engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
+        self.send_settings_snapshot(
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+        )
 
         try:
             supervisor_queue.put(Message("db", "db_ready", {"ts": time.time()}))
@@ -1952,6 +1628,36 @@ class DBWorker(object):
 
         print("[DB] Worker started: %s : mode=%s" % (self.db_path, self.mode))
         self.last_log_flush = time.time()
+
+        handler_map = {
+            "request_settings_snapshot": self.handle_request_settings_snapshot,
+            "get_setting": self.handle_get_setting,
+            "set_setting": self.handle_set_setting,
+            "get_programs": self.handle_get_programs,
+            "get_program": self.handle_get_program,
+            "get_active_ch_program": self.handle_get_active_ch_program,
+            "update_program_setpoint": self.handle_update_program_setpoint,
+            "create_program": self.handle_create_program,
+            "update_program": self.handle_update_program,
+            "delete_program": self.handle_delete_program,
+            "copy_program": self.handle_copy_program,
+            "get_state_log": self.handle_get_state_log,
+            "get_temperature_log": self.handle_get_temperature_log,
+            "get_schedule_sets": self.handle_get_schedule_sets,
+            "get_holidays": self.handle_get_holidays,
+            "get_holiday": self.handle_get_holiday,
+            "create_holiday": self.handle_create_holiday,
+            "update_holiday": self.handle_update_holiday,
+            "delete_holiday": self.handle_delete_holiday,
+            "copy_holiday": self.handle_copy_holiday,
+            "get_special_periods": self.handle_get_special_periods,
+            "get_special_period": self.handle_get_special_period,
+            "create_special_period": self.handle_create_special_period,
+            "update_special_period": self.handle_update_special_period,
+            "delete_special_period": self.handle_delete_special_period,
+            "copy_special_period": self.handle_copy_special_period,
+            "request_system_action": self.handle_request_system_action,
+        }
 
         while not shutdown_event.is_set():
             try:
@@ -1967,146 +1673,50 @@ class DBWorker(object):
 
                 msg = queue.get(timeout=1)
 
-                # ---- settings RPC ----
-                if msg.type == "get_setting":
-                    self.handle_get_setting(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-
-                elif msg.type == "set_setting":
-                    self.handle_set_setting(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "get_programs":
-                    print("[DB] get_programs request from %s payload=%r" % (msg.source, msg.payload))
-                    self.handle_get_programs(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "get_program":
-                    self.handle_get_program(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "get_active_ch_program":
-                    self.handle_get_active_ch_program(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "update_program_setpoint":
-                    self.handle_update_program_setpoint(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "create_program":
-                    self.handle_create_program(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "update_program":
-                    self.handle_update_program(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "delete_program":
-                    self.handle_delete_program(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "copy_program":
-                    self.handle_copy_program(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
-
-                elif msg.type == "heartbeat":
+                if msg.type == "heartbeat":
                     self.handle_heartbeat(msg, supervisor_queue)
+                    continue
 
-                # ---- logs ----
-                elif msg.type == "temperature":
+                if msg.type == "temperature":
                     self.handle_temperature_log(msg)
-                elif msg.type == "state_change":
-                    self.handle_state_change(msg)
+                    continue
 
-                elif msg.type == "flush":
-                    # force flush logs/settings now
+                if msg.type == "state_change":
+                    self.handle_state_change(msg)
+                    continue
+
+                if msg.type == "flush":
                     self.flush_settings()
                     self.flush_logs_if_due(force=True)
+                    continue
 
-                elif msg.type == "cleanup_expired_overrides":
+                if msg.type == "cleanup_expired_overrides":
                     self.handle_cleanup_expired_overrides(msg)
+                    continue
 
-                elif msg.type == "get_state_log":
-                    self.handle_get_state_log(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
+                if msg.type == "shutdown":
+                    break
 
-                elif msg.type == "get_temperature_log":
-                    self.handle_get_temperature_log(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
+                handler = handler_map.get(msg.type)
 
-                elif msg.type == "get_schedule_sets":
-                    self.handle_get_schedule_sets(
-                        msg,
-                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
-                    )
+                if handler is None:
+                    print("[DB] WARNING: unknown message type %r from %r" % (msg.type, msg.source))
+                    continue
 
-                elif msg.type == "get_holidays":
-                    self.handle_get_holidays(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "get_holiday":
-                    self.handle_get_holiday(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "create_holiday":
-                    self.handle_create_holiday(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "update_holiday":
-                    self.handle_update_holiday(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "delete_holiday":
-                    self.handle_delete_holiday(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "copy_holiday":
-                    self.handle_copy_holiday(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "get_special_periods":
-                    self.handle_get_special_periods(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "get_special_period":
-                    self.handle_get_special_period(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "create_special_period":
-                    self.handle_create_special_period(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "update_special_period":
-                    self.handle_update_special_period(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "delete_special_period":
-                    self.handle_delete_special_period(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "copy_special_period":
-                    self.handle_copy_special_period(msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue)
-
-                elif msg.type == "request_system_action":
-                    self.handle_request_system_action(
+                if msg.type == "request_system_action":
+                    handler(
                         msg,
                         engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
                         ui_ctrl_queue, web_ctrl_queue, supervisor_queue
                     )
-
-                elif msg.type == "shutdown":
-                    break
+                else:
+                    handler(
+                        msg,
+                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                        ui_ctrl_queue, web_ctrl_queue
+                    )
 
             except QueueEmpty:
-                # no message this second; periodic flush already handled
                 continue
             except Exception:
                 print("[DB] Worker error")

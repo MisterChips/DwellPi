@@ -6,6 +6,14 @@ from __future__ import print_function
 import time
 
 
+class _NoOpLock(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 class SettingsSyncMixin(object):
     def _settings_store(self):
         """
@@ -16,6 +24,13 @@ class SettingsSyncMixin(object):
             return self.settings
         """
         raise NotImplementedError
+
+    def _settings_lock(self):
+        """
+        Optional hook for a lock protecting the settings store.
+        Subclasses can override to return a real lock.
+        """
+        return _NoOpLock()
 
     def _on_setting_changed(self, key, value):
         """
@@ -29,16 +44,22 @@ class SettingsSyncMixin(object):
         if not values:
             return
 
-        store = self._settings_store()
-        store.update(values)
+        try:
+            with self._settings_lock():
+                store = self._settings_store()
+                store.update(values)
 
-        for key, value in values.items():
-            self.apply_setting_changed(key, value)
+            for key, value in values.items():
+                self._on_setting_changed(key, value)
+        except Exception as e:
+            print("[SettingsSync] Failed to apply snapshot: %s" % e)
 
     def apply_setting_changed(self, key, value):
         try:
-            store = self._settings_store()
-            store[key] = value
+            with self._settings_lock():
+                store = self._settings_store()
+                store[key] = value
+
             self._on_setting_changed(key, value)
         except Exception as e:
             print("[SettingsSync] Failed to apply setting %s=%r: %s" % (key, value, e))

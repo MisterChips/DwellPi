@@ -248,7 +248,7 @@ class UIProcess(SettingsSyncMixin, object):
                     pass
                 last_hb = now
 
-            time.sleep(0.1)
+            time.sleep(0.3)
 
         ui_input.cleanup_gpio()
         print("[UI] Shutting down cleanly")

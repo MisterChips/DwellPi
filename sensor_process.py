@@ -24,6 +24,10 @@ class SensorProcess(SettingsClient):
         self.sensor_device_id = None
         self.reader = None
 
+        self.sensor_failed = False
+        self.sensor_fail_count = 0
+        self.sensor_backoff_until = 0.0
+
         # DB temperature log throttling
         self.last_logged_temp = None
         self.last_logged_temp_epoch = 0.0
@@ -50,6 +54,9 @@ class SensorProcess(SettingsClient):
             if new_id != self.sensor_device_id:
                 self.sensor_device_id = new_id or None
                 self.reader = None
+                self.sensor_failed = False
+                self.sensor_fail_count = 0
+                self.sensor_backoff_until = 0.0
                 print("[Sensor] SENSOR_DEVICE_ID updated: %s" % self.sensor_device_id)
 
     def _should_log_temperature(self, temp_c, now_epoch):
@@ -74,6 +81,12 @@ class SensorProcess(SettingsClient):
         print("[Sensor] Started in mode: %s" % self.mode)
 
         ok = self.wait_for_initial_snapshot(timeout=3.0)
+
+        try:
+            self.db_queue.put(Message("sensor", "request_settings_snapshot", {}))
+        except Exception:
+            pass
+
         if not ok:
             print("[Sensor] No settings snapshot received yet; using defaults")
 
@@ -93,6 +106,12 @@ class SensorProcess(SettingsClient):
                 time.sleep(self.sensor_interval)
                 continue
 
+            now_epoch = time.time()
+
+            if now_epoch < self.sensor_backoff_until:
+                time.sleep(self.sensor_interval)
+                continue
+
             if self.reader is None:
                 try:
                     self.reader = TemperatureReader(
@@ -104,6 +123,22 @@ class SensorProcess(SettingsClient):
                     print("[Sensor] Reader created for SENSOR_DEVICE_ID=%s" % self.sensor_device_id)
                 except Exception as e:
                     print("[Sensor] Failed to create reader: %s" % e)
+                    self.sensor_fail_count += 1
+
+                    if not self.sensor_failed:
+                        self.sensor_failed = True
+                        try:
+                            self.db_queue.put(Message("sensor", "state_change", {
+                                "system": "SENSOR",
+                                "state": "SENSOR_FAIL"
+                            }))
+                        except Exception:
+                            pass
+
+                    if self.sensor_fail_count >= 5:
+                        self.sensor_backoff_until = time.time() + 30.0
+                        print("[Sensor] Backing off for 30s after %s failures" % self.sensor_fail_count)
+
                     time.sleep(self.sensor_interval)
                     continue
 
@@ -113,6 +148,18 @@ class SensorProcess(SettingsClient):
 
                 print("[Sensor] raw=%.1fC adj=%.1fC (adj=%+.1f) interval=%.2f" %
                       (raw_c, adj_c, self.temp_adjust, self.sensor_interval))
+
+                if self.sensor_failed:
+                    self.sensor_failed = False
+                    self.sensor_fail_count = 0
+                    self.sensor_backoff_until = 0.0
+                    self.db_queue.put(Message("sensor", "state_change", {
+                        "system": "SENSOR",
+                        "state": "SENSOR_OK"
+                    }))
+                else:
+                    self.sensor_fail_count = 0
+                    self.sensor_backoff_until = 0.0
 
                 now_epoch = time.time()
 
@@ -143,13 +190,25 @@ class SensorProcess(SettingsClient):
                 except Exception:
                     pass
 
+
             except Exception as e:
                 print("[Sensor] Temp read FAILED: %s" % e)
                 self.reader = None
-                self.db_queue.put(Message("sensor", "state_change", {
-                    "system": "SENSOR",
-                    "state": "Temp read failed: %s" % e
-                }))
+                self.sensor_fail_count += 1
+
+                if not self.sensor_failed:
+                    self.sensor_failed = True
+                    try:
+                        self.db_queue.put(Message("sensor", "state_change", {
+                            "system": "SENSOR",
+                            "state": "SENSOR_FAIL"
+                        }))
+                    except Exception:
+                        pass
+
+                if self.sensor_fail_count >= 5:
+                    self.sensor_backoff_until = time.time() + 30.0
+                    print("[Sensor] Backing off for 30s after %s failures" % self.sensor_fail_count)
 
             time.sleep(self.sensor_interval)
 

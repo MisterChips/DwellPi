@@ -448,7 +448,7 @@ class UIController(object):
             se.start_time = default_start
             se.end_time = default_end
             se.systems = "CH"
-            se.schedule_set_name = "BOOST"
+            se.schedule_set_name = "HOLIDAY"
             se.enabled = True
             se.note = ""
 
@@ -465,7 +465,7 @@ class UIController(object):
         se.start_time = "01/01/25,00:00"
         se.end_time = "01/01/25,00:00"
         se.systems = "CH"
-        se.schedule_set_name = "BOOST"
+        se.schedule_set_name = "HOLIDAY"
         se.enabled = True
         se.note = ""
         se.field_index = 0

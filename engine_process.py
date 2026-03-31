@@ -13,7 +13,8 @@ from settings_client import SettingsClient
 
 
 class EngineProcess(SettingsClient):
-    def __init__(self, engine_queue, engine_rpc_queue, ui_queue, web_queue, db_queue, ctrl_queue, relay_queue, mode, db_path, shutdown_event):
+    def __init__(self, engine_queue, engine_rpc_queue, ui_queue, web_queue,
+                 db_queue, ctrl_queue, relay_queue, mode, db_path, shutdown_event):
         SettingsClient.__init__(self, ctrl_queue, shutdown_event, name="Engine")
 
         self.engine_queue = engine_queue
@@ -38,9 +39,12 @@ class EngineProcess(SettingsClient):
         # defaults (will be overwritten by snapshot/push)
         self.engine_interval = 2.0
         self.current_temp = None
+        self.last_temp_update_epoch = 0.0
+        self.temp_stale_timeout = 300.0   # seconds
+        self._temp_stale_active = False
 
-        self.ch_system_switch = "timed"  # timed/on/off/once
-        self.hw_system_switch = "timed"  # timed/on/off/once
+        self.ch_system_switch = "timed"   # timed/on/off/once
+        self.hw_system_switch = "timed"   # timed/on/off/once
         self.ch_advance = False
         self.hw_advance = False
 
@@ -119,7 +123,12 @@ class EngineProcess(SettingsClient):
         req_id = uuid.uuid4().hex
 
         try:
-            self.relay_queue.put(Message("engine", "relay_status", {"request_id": req_id}))
+            self.relay_queue.put(Message(
+                "engine",
+                "relay_status",
+                {},
+                request_id=req_id
+            ))
         except Exception:
             return False
 
@@ -131,10 +140,17 @@ class EngineProcess(SettingsClient):
                 continue
 
             if getattr(msg, "type", None) != "relay_status_result":
+                print("[Engine] Startup relay reply ignored: type=%r" % getattr(msg, "type", None))
                 continue
+
             if getattr(msg, "request_id", None) != req_id:
+                print("[Engine] Startup relay reply ignored: request_id=%r expected=%r" % (
+                    getattr(msg, "request_id", None), req_id
+                ))
                 continue
-            if getattr(msg, "target", None) not in (None, "engine"):
+
+            if getattr(msg, "target", None) not in (None, "engine", ""):
+                print("[Engine] Startup relay reply ignored: target=%r" % getattr(msg, "target", None))
                 continue
 
             p = msg.payload or {}
@@ -191,6 +207,7 @@ class EngineProcess(SettingsClient):
             if m.type == "TEMP_UPDATE":
                 try:
                     self.current_temp = float((m.payload or {}).get("temperature"))
+                    self.last_temp_update_epoch = time.time()
                 except Exception:
                     pass
 
@@ -291,15 +308,6 @@ class EngineProcess(SettingsClient):
         except Exception:
             return False
 
-    def _entry_window_for_today(self, entry, now_epoch):
-        start_epoch = self._time_text_to_today_epoch(entry["start_time"], now_epoch)
-        end_epoch = self._time_text_to_today_epoch(entry["end_time"], now_epoch)
-
-        if end_epoch <= start_epoch:
-            end_epoch += 86400.0
-
-        return start_epoch, end_epoch
-
     def _is_entry_active_now(self, entry, now_epoch, weekday_0_mon, days_str):
         today_epoch = now_epoch
         yesterday_epoch = now_epoch - 86400.0
@@ -354,18 +362,29 @@ class EngineProcess(SettingsClient):
             return row[1]
         return None
 
-    def _get_active_entry(self, schedule_set_name, system, weekday_0_mon, hhmm, now_epoch):
+    def _get_active_schedule_entry(self, schedule_set_name, system, weekday_0_mon, hhmm, now_epoch):
         cur = self.db_con.cursor()
-        cur.execute("""
-                    SELECT id, start_time, end_time, setpoint, warmup, note, days
-                    FROM schedule_entries
-                    WHERE enabled = 1
-                      AND schedule_set_name = ?
-                      AND system = ?
-                    ORDER BY start_time ASC
-                    """, (schedule_set_name, system))
-        rows = cur.fetchall()
 
+        if system == "CH":
+            cur.execute("""
+                SELECT id, start_time, end_time, setpoint, warmup, note, days
+                FROM schedule_entries
+                WHERE enabled = 1
+                  AND schedule_set_name = ?
+                  AND system = ?
+                ORDER BY start_time ASC
+            """, (schedule_set_name, system))
+        else:
+            cur.execute("""
+                SELECT id, start_time, end_time, NULL as setpoint, 0 as warmup, note, days
+                FROM schedule_entries
+                WHERE enabled = 1
+                  AND schedule_set_name = ?
+                  AND system = ?
+                ORDER BY start_time ASC
+            """, (schedule_set_name, system))
+
+        rows = cur.fetchall()
         matches = []
 
         for r in rows:
@@ -381,55 +400,45 @@ class EngineProcess(SettingsClient):
 
             days_str = str(entry["days"] or "")
 
-            today_epoch = now_epoch
-            yesterday_epoch = now_epoch - 86400.0
-            today_wd = weekday_0_mon
-            yesterday_wd = (weekday_0_mon - 1) % 7
+            if self._is_entry_active_now(entry, now_epoch, weekday_0_mon, days_str):
+                today_epoch = now_epoch
+                yesterday_epoch = now_epoch - 86400.0
+                today_wd = weekday_0_mon
+                yesterday_wd = (weekday_0_mon - 1) % 7
 
-            try:
                 overnight = str(entry["end_time"]) <= str(entry["start_time"])
-            except Exception:
-                overnight = False
 
-            matched = False
-
-            if str(today_wd) in days_str:
-                try:
+                if str(today_wd) in days_str and self._is_entry_active_now_for_day(entry, now_epoch, today_epoch):
                     start_epoch, end_epoch = self._entry_window_for_day(entry, today_epoch)
-                    if start_epoch <= now_epoch < end_epoch:
-                        entry["window_start_epoch"] = start_epoch
-                        entry["window_end_epoch"] = end_epoch
-                        matches.append(entry)
-                        matched = True
-                except Exception:
-                    pass
+                    entry["window_start_epoch"] = start_epoch
+                    entry["window_end_epoch"] = end_epoch
+                    matches.append(entry)
+                    continue
 
-            if (not matched) and overnight and str(yesterday_wd) in days_str:
-                try:
+                if overnight and str(yesterday_wd) in days_str and \
+                        self._is_entry_active_now_for_day(entry, now_epoch, yesterday_epoch):
                     start_epoch, end_epoch = self._entry_window_for_day(entry, yesterday_epoch)
-                    if start_epoch <= now_epoch < end_epoch:
-                        entry["window_start_epoch"] = start_epoch
-                        entry["window_end_epoch"] = end_epoch
-                        matches.append(entry)
-                except Exception:
-                    pass
+                    entry["window_start_epoch"] = start_epoch
+                    entry["window_end_epoch"] = end_epoch
+                    matches.append(entry)
+
         if not matches:
             return None
 
         if len(matches) > 1:
-            print("[Engine] WARNING: overlapping entries detected for %s/%s at %s" %
-                  (schedule_set_name, system, hhmm))
+            print("[Engine] WARNING: overlapping %s entries detected for %s at %s" %
+                  (system, schedule_set_name, hhmm))
 
         return matches[0]
 
     def _get_active_entry_with_special_fallback(self, system, weekday_0_mon, hhmm, now_epoch, special_set_name=None):
         if special_set_name:
-            entry = self._get_active_entry(special_set_name, system, weekday_0_mon, hhmm, now_epoch)
+            entry = self._get_active_schedule_entry(special_set_name, system, weekday_0_mon, hhmm, now_epoch)
             if entry:
                 entry["source_set"] = special_set_name
                 return entry
 
-        entry = self._get_active_entry("NORMAL", system, weekday_0_mon, hhmm, now_epoch)
+        entry = self._get_active_schedule_entry("NORMAL", system, weekday_0_mon, hhmm, now_epoch)
         if entry:
             entry["source_set"] = "NORMAL"
             return entry
@@ -437,85 +446,163 @@ class EngineProcess(SettingsClient):
         return None
 
     def _get_active_hw_entry_with_special_fallback(self, weekday_0_mon, hhmm, now_epoch, special_set_name=None):
-        if special_set_name:
-            entry = self._get_active_hw_entry(special_set_name, weekday_0_mon, hhmm, now_epoch)
-            if entry:
-                entry["source_set"] = special_set_name
-                return entry
+        return self._get_active_entry_with_special_fallback("HW", weekday_0_mon, hhmm, now_epoch, special_set_name)
 
-        entry = self._get_active_hw_entry("NORMAL", weekday_0_mon, hhmm, now_epoch)
-        if entry:
-            entry["source_set"] = "NORMAL"
-            return entry
-
-        return None
-
-    def _get_active_hw_entry(self, schedule_set_name, weekday_0_mon, hhmm, now_epoch):
+    def _get_once_rows_for_set(self, set_name, system, weekday_0_mon, now_epoch):
         cur = self.db_con.cursor()
-        cur.execute("""
-                    SELECT id, start_time, end_time, note, days
-                    FROM schedule_entries
-                    WHERE enabled = 1
-                      AND schedule_set_name = ?
-                      AND system = 'HW'
-                    ORDER BY start_time ASC
-                    """, (schedule_set_name,))
+
+        if system == "CH":
+            cur.execute("""
+                        SELECT id, start_time, end_time, setpoint, warmup, note, days
+                        FROM schedule_entries
+                        WHERE enabled = 1
+                          AND schedule_set_name = ?
+                          AND system = ?
+                        ORDER BY start_time ASC
+                        """, (set_name, system))
+        else:
+            cur.execute("""
+                        SELECT id, start_time, end_time, NULL as setpoint, 0 as warmup, note, days
+                        FROM schedule_entries
+                        WHERE enabled = 1
+                          AND schedule_set_name = ?
+                          AND system = ?
+                        ORDER BY start_time ASC
+                        """, (set_name, system))
+
         rows = cur.fetchall()
+        items = []
 
-        matches = []
+        today_wd = weekday_0_mon
+        yesterday_wd = (weekday_0_mon - 1) % 7
 
-        for r in rows:
-            entry = {
-                "id": r[0],
-                "start_time": r[1],
-                "end_time": r[2],
-                "note": r[3],
-                "days": r[4],
+        for row in rows:
+            base_entry = {
+                "id": row[0],
+                "start_time": row[1],
+                "end_time": row[2],
+                "setpoint": row[3],
+                "warmup": row[4],
+                "note": row[5],
+                "days": row[6],
+                "source_set": set_name,
             }
 
-            days_str = str(entry["days"] or "")
-
-            today_epoch = now_epoch
-            yesterday_epoch = now_epoch - 86400.0
-            today_wd = weekday_0_mon
-            yesterday_wd = (weekday_0_mon - 1) % 7
+            days_str = str(base_entry["days"] or "")
 
             try:
-                overnight = str(entry["end_time"]) <= str(entry["start_time"])
+                overnight = str(base_entry["end_time"]) <= str(base_entry["start_time"])
             except Exception:
                 overnight = False
 
-            matched = False
-
             if str(today_wd) in days_str:
                 try:
-                    start_epoch, end_epoch = self._entry_window_for_day(entry, today_epoch)
-                    if start_epoch <= now_epoch < end_epoch:
-                        entry["window_start_epoch"] = start_epoch
-                        entry["window_end_epoch"] = end_epoch
-                        matches.append(entry)
-                        matched = True
+                    start_epoch, end_epoch = self._entry_window_for_day(base_entry, now_epoch)
+                    e = dict(base_entry)
+                    e["window_start_epoch"] = start_epoch
+                    e["window_end_epoch"] = end_epoch
+                    items.append(e)
                 except Exception:
                     pass
 
-            if (not matched) and overnight and str(yesterday_wd) in days_str:
+            if overnight and str(yesterday_wd) in days_str:
                 try:
-                    start_epoch, end_epoch = self._entry_window_for_day(entry, yesterday_epoch)
-                    if start_epoch <= now_epoch < end_epoch:
-                        entry["window_start_epoch"] = start_epoch
-                        entry["window_end_epoch"] = end_epoch
-                        matches.append(entry)
+                    yesterday_epoch = now_epoch - 86400.0
+                    start_epoch, end_epoch = self._entry_window_for_day(base_entry, yesterday_epoch)
+                    e = dict(base_entry)
+                    e["window_start_epoch"] = start_epoch
+                    e["window_end_epoch"] = end_epoch
+                    items.append(e)
                 except Exception:
                     pass
 
-        if not matches:
-            return None
+        return items
 
-        if len(matches) > 1:
-            print("[Engine] WARNING: overlapping HW entries detected for %s at %s" %
-                  (schedule_set_name, hhmm))
+    def _get_once_context(self, schedule_set_name, system, weekday_0_mon, now_epoch):
+        special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
 
-        return matches[0]
+        normal_rows = self._get_once_rows_for_set("NORMAL", system, weekday_0_mon, now_epoch)
+        special_rows = self._get_once_rows_for_set(
+            special_set_name, system, weekday_0_mon, now_epoch
+        ) if special_set_name else []
+
+        all_rows = normal_rows + special_rows
+
+        if not all_rows:
+            return {
+                "first_entry": None,
+                "last_entry": None,
+                "first_start_epoch": None,
+                "last_end_epoch": None,
+                "first_setpoint": None,
+                "in_window": False,
+            }
+
+        first_entry = None
+        first_start_epoch = None
+
+        for entry in all_rows:
+            start_epoch = entry.get("window_start_epoch")
+            if start_epoch is None:
+                continue
+
+            if first_start_epoch is None or start_epoch < first_start_epoch:
+                first_entry = entry
+                first_start_epoch = start_epoch
+            elif start_epoch == first_start_epoch:
+                if entry.get("source_set") != "NORMAL" and first_entry.get("source_set") == "NORMAL":
+                    first_entry = entry
+                    first_start_epoch = start_epoch
+
+        last_entry = None
+        last_end_epoch = None
+
+        for entry in all_rows:
+            end_epoch = entry.get("window_end_epoch")
+            if end_epoch is None:
+                continue
+
+            if last_end_epoch is None or end_epoch > last_end_epoch:
+                last_entry = entry
+                last_end_epoch = end_epoch
+            elif end_epoch == last_end_epoch:
+                if entry.get("source_set") != "NORMAL" and last_entry.get("source_set") == "NORMAL":
+                    last_entry = entry
+                    last_end_epoch = end_epoch
+
+        if first_entry is None or last_entry is None:
+            return {
+                "first_entry": None,
+                "last_entry": None,
+                "first_start_epoch": None,
+                "last_end_epoch": None,
+                "first_setpoint": None,
+                "in_window": False,
+            }
+
+        in_window = (first_start_epoch <= now_epoch < last_end_epoch)
+
+        first_setpoint = None
+        if system == "CH":
+            try:
+                first_setpoint = float(first_entry["setpoint"] or self.default_setpoint)
+            except Exception:
+                first_setpoint = float(self.default_setpoint)
+
+        return {
+            "first_entry": first_entry,
+            "last_entry": last_entry,
+            "first_start_epoch": first_start_epoch,
+            "last_end_epoch": last_end_epoch,
+            "first_setpoint": first_setpoint,
+            "in_window": in_window,
+        }
+
+    def _get_ch_once_context(self, schedule_set_name, weekday_0_mon, now_epoch):
+        return self._get_once_context(schedule_set_name, "CH", weekday_0_mon, now_epoch)
+
+    def _get_hw_once_context(self, schedule_set_name, weekday_0_mon, now_epoch):
+        return self._get_once_context(schedule_set_name, "HW", weekday_0_mon, now_epoch)
 
     def _get_next_entry_for_set(self, schedule_set_name, system, now_epoch):
         cur = self.db_con.cursor()
@@ -558,11 +645,7 @@ class EngineProcess(SettingsClient):
 
                 try:
                     day_epoch = time.mktime(dt_day.timetuple())
-
-                    start_epoch = self._time_text_to_epoch_for_day(
-                        entry["start_time"],
-                        day_epoch
-                    )
+                    start_epoch = self._time_text_to_epoch_for_day(entry["start_time"], day_epoch)
                 except Exception:
                     continue
 
@@ -602,6 +685,177 @@ class EngineProcess(SettingsClient):
             return True
         return bool(self.relay_enable)
 
+    def _is_temperature_stale(self, now_epoch):
+        if self.current_temp is None:
+            return True
+
+        try:
+            last_update = float(self.last_temp_update_epoch or 0.0)
+        except Exception:
+            last_update = 0.0
+
+        if last_update <= 0.0:
+            return True
+
+        return (now_epoch - last_update) >= float(self.temp_stale_timeout)
+
+    def _clear_advance(self, system):
+        key = "%s_ADVANCE" % system
+        try:
+            self.settings[key] = "False"
+            if system == "CH":
+                self.ch_advance = False
+            elif system == "HW":
+                self.hw_advance = False
+
+            self.db_queue.put(Message("engine", "set_setting", {
+                "key": key,
+                "value": "False"
+            }))
+            print("[Engine] %s advance auto-cleared" % system)
+        except Exception:
+            pass
+
+    def _get_ch_timed_context(self, schedule_set_name, weekday_0_mon, hhmm, now_epoch):
+        special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
+
+        current_entry = self._get_active_entry_with_special_fallback(
+            "CH", weekday_0_mon, hhmm, now_epoch, special_set_name
+        )
+
+        normal_next, normal_next_epoch = self._get_next_entry_for_set("NORMAL", "CH", now_epoch)
+
+        if special_set_name:
+            special_next, special_next_epoch = self._get_next_entry_for_set(special_set_name, "CH", now_epoch)
+        else:
+            special_next, special_next_epoch = None, None
+
+        best_next, best_start_epoch = self._choose_earlier_entry(
+            special_next, special_next_epoch,
+            normal_next, normal_next_epoch
+        )
+
+        ctx = {
+            "current_entry": current_entry,
+            "next_entry": best_next,
+            "current_target": None,
+            "advanced_target": None,
+            "advance_until_epoch": None,
+            "warmup_active": False,
+            "warmup_entry": None,
+            "warmup_target": None,
+            "warmup_start_epoch": None,
+        }
+
+        if current_entry:
+            ctx["current_target"] = float(current_entry["setpoint"] or self.default_setpoint)
+
+            try:
+                end_epoch = current_entry.get("window_end_epoch")
+            except Exception:
+                end_epoch = None
+
+            ctx["advanced_target"] = None
+            ctx["advance_until_epoch"] = end_epoch
+
+        else:
+            if best_next:
+                ctx["advanced_target"] = float(best_next["setpoint"] or self.default_setpoint)
+                ctx["advance_until_epoch"] = best_start_epoch
+
+                try:
+                    warmup_enabled = parse_bool(best_next.get("warmup"))
+                except Exception:
+                    warmup_enabled = False
+
+                if warmup_enabled and self.current_temp is not None:
+                    try:
+                        entry_setpoint = float(best_next.get("setpoint") or self.default_setpoint)
+                    except Exception:
+                        entry_setpoint = float(self.default_setpoint)
+
+                    try:
+                        heatup_rate = float(self.settings.get("HEATUP_RATE", "0.4"))
+                    except Exception:
+                        heatup_rate = 0.4
+
+                    try:
+                        min_startup = int(float(self.settings.get("MINIMUM_HEATING_STARTUP_TIME", "30")))
+                    except Exception:
+                        min_startup = 30
+
+                    try:
+                        max_startup = int(float(self.settings.get("MAXIMUM_HEATING_STARTUP_TIME", "120")))
+                    except Exception:
+                        max_startup = 120
+
+                    try:
+                        target_offset = float(self.settings.get("TARGET_SETPOINT_OFFSET", "0.0"))
+                    except Exception:
+                        target_offset = 0.0
+
+                    if heatup_rate > 0:
+                        warm_target = entry_setpoint + target_offset
+                        delta_c = max(0.0, warm_target - float(self.current_temp))
+                        mins_needed = int(round((delta_c / heatup_rate) * 60.0))
+
+                        mins_needed = max(min_startup, mins_needed)
+                        mins_needed = min(max_startup, mins_needed)
+
+                        warmup_start_epoch = best_start_epoch - (mins_needed * 60.0)
+
+                        ctx["warmup_entry"] = best_next
+                        ctx["warmup_target"] = entry_setpoint
+                        ctx["warmup_start_epoch"] = warmup_start_epoch
+
+                        if warmup_start_epoch <= now_epoch < best_start_epoch:
+                            ctx["warmup_active"] = True
+
+        return ctx
+
+    def _get_hw_timed_context(self, schedule_set_name, weekday_0_mon, hhmm, now_epoch):
+        special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
+
+        current_entry = self._get_active_hw_entry_with_special_fallback(
+            weekday_0_mon, hhmm, now_epoch, special_set_name
+        )
+
+        normal_next, normal_next_epoch = self._get_next_entry_for_set("NORMAL", "HW", now_epoch)
+
+        if special_set_name:
+            special_next, special_next_epoch = self._get_next_entry_for_set(special_set_name, "HW", now_epoch)
+        else:
+            special_next, special_next_epoch = None, None
+
+        best_next, best_start_epoch = self._choose_earlier_entry(
+            special_next, special_next_epoch,
+            normal_next, normal_next_epoch
+        )
+
+        ctx = {
+            "current_entry": current_entry,
+            "next_entry": best_next,
+            "current_on": bool(current_entry is not None),
+            "advanced_on": False,
+            "advance_until_epoch": None,
+        }
+
+        if current_entry:
+            try:
+                end_epoch = current_entry.get("window_end_epoch")
+            except Exception:
+                end_epoch = None
+
+            ctx["advanced_on"] = False
+            ctx["advance_until_epoch"] = end_epoch
+
+        else:
+            if best_next:
+                ctx["advanced_on"] = True
+                ctx["advance_until_epoch"] = best_start_epoch
+
+        return ctx
+
     def _compute_ch_target(self, weekday, hhmm, now_epoch):
         sw = (self.ch_system_switch or "").lower()
 
@@ -624,7 +878,6 @@ class EngineProcess(SettingsClient):
         elif sw == "on":
             target = float(self.default_on_setpoint)
             reason = "switch=on"
-
 
         elif sw == "once":
             active_set_name = special_set_name or "NORMAL"
@@ -785,7 +1038,6 @@ class EngineProcess(SettingsClient):
             hw_target_on = True
             hw_reason = "switch=on"
 
-
         elif hw_sw == "once":
             active_set_name = special_set_name or "NORMAL"
             hw_once_ctx = self._get_hw_once_context(active_set_name, weekday, now_epoch)
@@ -884,8 +1136,8 @@ class EngineProcess(SettingsClient):
                 else:
                     hw_target_on = True
                     hw_reason = "id=%s set=%s %s-%s" % (
-                        hw_entry["id"], hw_entry.get("source_set", active_set_name), hw_entry["start_time"],
-                        hw_entry["end_time"]
+                        hw_entry["id"], hw_entry.get("source_set", active_set_name),
+                        hw_entry["start_time"], hw_entry["end_time"]
                     )
 
         else:
@@ -931,423 +1183,6 @@ class EngineProcess(SettingsClient):
             return "ON", lower, upper
         return "OFF", lower, upper
 
-    def _clear_advance(self, system):
-        key = "%s_ADVANCE" % system
-        try:
-            self.settings[key] = "False"
-            if system == "CH":
-                self.ch_advance = False
-            elif system == "HW":
-                self.hw_advance = False
-
-            self.db_queue.put(Message("engine", "set_setting", {
-                "key": key,
-                "value": "False"
-            }))
-            print("[Engine] %s advance auto-cleared" % system)
-        except Exception:
-            pass
-
-    def _get_ch_timed_context(self, schedule_set_name, weekday_0_mon, hhmm, now_epoch):
-        special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
-
-        current_entry = self._get_active_entry_with_special_fallback(
-            "CH", weekday_0_mon, hhmm, now_epoch, special_set_name
-        )
-
-        normal_next, normal_next_epoch = self._get_next_entry_for_set("NORMAL", "CH", now_epoch)
-
-        if special_set_name:
-            special_next, special_next_epoch = self._get_next_entry_for_set(special_set_name, "CH", now_epoch)
-        else:
-            special_next, special_next_epoch = None, None
-
-        best_next, best_start_epoch = self._choose_earlier_entry(
-            special_next, special_next_epoch,
-            normal_next, normal_next_epoch
-        )
-
-        ctx = {
-            "current_entry": current_entry,
-            "next_entry": best_next,
-            "current_target": None,
-            "advanced_target": None,
-            "advance_until_epoch": None,
-            "warmup_active": False,
-            "warmup_entry": None,
-            "warmup_target": None,
-            "warmup_start_epoch": None,
-        }
-
-        if current_entry:
-            ctx["current_target"] = float(current_entry["setpoint"] or self.default_setpoint)
-
-            try:
-                end_epoch = current_entry.get("window_end_epoch")
-            except Exception:
-                end_epoch = None
-
-            ctx["advanced_target"] = None
-            ctx["advance_until_epoch"] = end_epoch
-
-        else:
-            if best_next:
-                ctx["advanced_target"] = float(best_next["setpoint"] or self.default_setpoint)
-                ctx["advance_until_epoch"] = best_start_epoch
-
-                try:
-                    warmup_enabled = parse_bool(best_next.get("warmup"))
-                except Exception:
-                    warmup_enabled = False
-
-                if warmup_enabled and self.current_temp is not None:
-                    try:
-                        entry_setpoint = float(best_next.get("setpoint") or self.default_setpoint)
-                    except Exception:
-                        entry_setpoint = float(self.default_setpoint)
-
-                    try:
-                        heatup_rate = float(self.settings.get("HEATUP_RATE", "0.4"))
-                    except Exception:
-                        heatup_rate = 0.4
-
-                    try:
-                        min_startup = int(float(self.settings.get("MINIMUM_HEATING_STARTUP_TIME", "30")))
-                    except Exception:
-                        min_startup = 30
-
-                    try:
-                        max_startup = int(float(self.settings.get("MAXIMUM_HEATING_STARTUP_TIME", "120")))
-                    except Exception:
-                        max_startup = 120
-
-                    try:
-                        target_offset = float(self.settings.get("TARGET_SETPOINT_OFFSET", "0.0"))
-                    except Exception:
-                        target_offset = 0.0
-
-                    if heatup_rate > 0:
-                        warm_target = entry_setpoint + target_offset
-                        delta_c = max(0.0, warm_target - float(self.current_temp))
-                        mins_needed = int(round((delta_c / heatup_rate) * 60.0))
-
-                        mins_needed = max(min_startup, mins_needed)
-                        mins_needed = min(max_startup, mins_needed)
-
-                        warmup_start_epoch = best_start_epoch - (mins_needed * 60.0)
-
-                        ctx["warmup_entry"] = best_next
-                        ctx["warmup_target"] = entry_setpoint
-                        ctx["warmup_start_epoch"] = warmup_start_epoch
-
-                        if warmup_start_epoch <= now_epoch < best_start_epoch:
-                            ctx["warmup_active"] = True
-
-        return ctx
-
-    def _get_hw_timed_context(self, schedule_set_name, weekday_0_mon, hhmm, now_epoch):
-        special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
-
-        current_entry = self._get_active_hw_entry_with_special_fallback(
-            weekday_0_mon, hhmm, now_epoch, special_set_name
-        )
-
-        normal_next, normal_next_epoch = self._get_next_entry_for_set("NORMAL", "HW", now_epoch)
-
-        if special_set_name:
-            special_next, special_next_epoch = self._get_next_entry_for_set(special_set_name, "HW", now_epoch)
-        else:
-            special_next, special_next_epoch = None, None
-
-        best_next, best_start_epoch = self._choose_earlier_entry(
-            special_next, special_next_epoch,
-            normal_next, normal_next_epoch
-        )
-
-        ctx = {
-            "current_entry": current_entry,
-            "next_entry": best_next,
-            "current_on": bool(current_entry is not None),
-            "advanced_on": False,
-            "advance_until_epoch": None,
-        }
-
-        if current_entry:
-            try:
-                end_epoch = current_entry.get("window_end_epoch")
-            except Exception:
-                end_epoch = None
-
-            ctx["advanced_on"] = False
-            ctx["advance_until_epoch"] = end_epoch
-
-        else:
-            if best_next:
-                ctx["advanced_on"] = True
-                ctx["advance_until_epoch"] = best_start_epoch
-
-        return ctx
-
-    def _get_ch_once_context(self, schedule_set_name, weekday_0_mon, now_epoch):
-        special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
-
-        def _get_once_rows(set_name):
-            cur = self.db_con.cursor()
-            cur.execute("""
-                        SELECT id, start_time, end_time, setpoint, warmup, note, days
-                        FROM schedule_entries
-                        WHERE enabled = 1
-                          AND schedule_set_name = ?
-                          AND system = 'CH'
-                        ORDER BY start_time ASC
-                        """, (set_name,))
-            rows = cur.fetchall()
-
-            items = []
-            for row in rows:
-                base_entry = {
-                    "id": row[0],
-                    "start_time": row[1],
-                    "end_time": row[2],
-                    "setpoint": row[3],
-                    "warmup": row[4],
-                    "note": row[5],
-                    "days": row[6],
-                    "source_set": set_name,
-                }
-
-                days_str = str(base_entry["days"] or "")
-                today_wd = weekday_0_mon
-                yesterday_wd = (weekday_0_mon - 1) % 7
-
-                try:
-                    overnight = str(base_entry["end_time"]) <= str(base_entry["start_time"])
-                except Exception:
-                    overnight = False
-
-                # Candidate anchored to today
-                if str(today_wd) in days_str:
-                    try:
-                        start_epoch, end_epoch = self._entry_window_for_day(base_entry, now_epoch)
-                        e = dict(base_entry)
-                        e["window_start_epoch"] = start_epoch
-                        e["window_end_epoch"] = end_epoch
-                        items.append(e)
-                    except Exception:
-                        pass
-
-                # Candidate anchored to yesterday for overnight carry-over
-                if overnight and str(yesterday_wd) in days_str:
-                    try:
-                        yesterday_epoch = now_epoch - 86400.0
-                        start_epoch, end_epoch = self._entry_window_for_day(base_entry, yesterday_epoch)
-                        e = dict(base_entry)
-                        e["window_start_epoch"] = start_epoch
-                        e["window_end_epoch"] = end_epoch
-                        items.append(e)
-                    except Exception:
-                        pass
-
-            return items
-
-        normal_rows = _get_once_rows("NORMAL")
-        special_rows = _get_once_rows(special_set_name) if special_set_name else []
-
-        all_rows = normal_rows + special_rows
-
-        if not all_rows:
-            return {
-                "first_entry": None,
-                "last_entry": None,
-                "first_start_epoch": None,
-                "last_end_epoch": None,
-                "first_setpoint": None,
-                "in_window": False,
-            }
-
-        first_entry = None
-        first_start_epoch = None
-
-        for entry in all_rows:
-            start_epoch = entry.get("window_start_epoch")
-            if start_epoch is None:
-                continue
-
-            if first_start_epoch is None or start_epoch < first_start_epoch:
-                first_entry = entry
-                first_start_epoch = start_epoch
-            elif start_epoch == first_start_epoch:
-                if entry.get("source_set") != "NORMAL" and first_entry.get("source_set") == "NORMAL":
-                    first_entry = entry
-                    first_start_epoch = start_epoch
-
-        last_entry = None
-        last_end_epoch = None
-
-        for entry in all_rows:
-            end_epoch = entry.get("window_end_epoch")
-            if end_epoch is None:
-                continue
-
-            if last_end_epoch is None or end_epoch > last_end_epoch:
-                last_entry = entry
-                last_end_epoch = end_epoch
-            elif end_epoch == last_end_epoch:
-                if entry.get("source_set") != "NORMAL" and last_entry.get("source_set") == "NORMAL":
-                    last_entry = entry
-                    last_end_epoch = end_epoch
-
-        if first_entry is None or last_entry is None:
-            return {
-                "first_entry": None,
-                "last_entry": None,
-                "first_start_epoch": None,
-                "last_end_epoch": None,
-                "first_setpoint": None,
-                "in_window": False,
-            }
-
-        in_window = (first_start_epoch <= now_epoch < last_end_epoch)
-
-        try:
-            first_setpoint = float(first_entry["setpoint"] or self.default_setpoint)
-        except Exception:
-            first_setpoint = float(self.default_setpoint)
-
-        return {
-            "first_entry": first_entry,
-            "last_entry": last_entry,
-            "first_start_epoch": first_start_epoch,
-            "last_end_epoch": last_end_epoch,
-            "first_setpoint": first_setpoint,
-            "in_window": in_window,
-        }
-
-    def _get_hw_once_context(self, schedule_set_name, weekday_0_mon, now_epoch):
-        special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
-
-        def _get_once_rows(set_name):
-            cur = self.db_con.cursor()
-            cur.execute("""
-                        SELECT id, start_time, end_time, note, days
-                        FROM schedule_entries
-                        WHERE enabled = 1
-                          AND schedule_set_name = ?
-                          AND system = 'HW'
-                        ORDER BY start_time ASC
-                        """, (set_name,))
-            rows = cur.fetchall()
-
-            items = []
-            for row in rows:
-                base_entry = {
-                    "id": row[0],
-                    "start_time": row[1],
-                    "end_time": row[2],
-                    "note": row[3],
-                    "days": row[4],
-                    "source_set": set_name,
-                }
-
-                days_str = str(base_entry["days"] or "")
-                today_wd = weekday_0_mon
-                yesterday_wd = (weekday_0_mon - 1) % 7
-
-                try:
-                    overnight = str(base_entry["end_time"]) <= str(base_entry["start_time"])
-                except Exception:
-                    overnight = False
-
-                # Candidate anchored to today
-                if str(today_wd) in days_str:
-                    try:
-                        start_epoch, end_epoch = self._entry_window_for_day(base_entry, now_epoch)
-                        e = dict(base_entry)
-                        e["window_start_epoch"] = start_epoch
-                        e["window_end_epoch"] = end_epoch
-                        items.append(e)
-                    except Exception:
-                        pass
-
-                # Candidate anchored to yesterday for overnight carry-over
-                if overnight and str(yesterday_wd) in days_str:
-                    try:
-                        yesterday_epoch = now_epoch - 86400.0
-                        start_epoch, end_epoch = self._entry_window_for_day(base_entry, yesterday_epoch)
-                        e = dict(base_entry)
-                        e["window_start_epoch"] = start_epoch
-                        e["window_end_epoch"] = end_epoch
-                        items.append(e)
-                    except Exception:
-                        pass
-
-            return items
-
-        normal_rows = _get_once_rows("NORMAL")
-        special_rows = _get_once_rows(special_set_name) if special_set_name else []
-
-        all_rows = normal_rows + special_rows
-
-        if not all_rows:
-            return {
-                "first_entry": None,
-                "last_entry": None,
-                "first_start_epoch": None,
-                "last_end_epoch": None,
-                "in_window": False,
-            }
-
-        first_entry = None
-        first_start_epoch = None
-
-        for entry in all_rows:
-            start_epoch = entry.get("window_start_epoch")
-            if start_epoch is None:
-                continue
-
-            if first_start_epoch is None or start_epoch < first_start_epoch:
-                first_entry = entry
-                first_start_epoch = start_epoch
-            elif start_epoch == first_start_epoch:
-                if entry.get("source_set") != "NORMAL" and first_entry.get("source_set") == "NORMAL":
-                    first_entry = entry
-                    first_start_epoch = start_epoch
-
-        last_entry = None
-        last_end_epoch = None
-
-        for entry in all_rows:
-            end_epoch = entry.get("window_end_epoch")
-            if end_epoch is None:
-                continue
-
-            if last_end_epoch is None or end_epoch > last_end_epoch:
-                last_entry = entry
-                last_end_epoch = end_epoch
-            elif end_epoch == last_end_epoch:
-                if entry.get("source_set") != "NORMAL" and last_entry.get("source_set") == "NORMAL":
-                    last_entry = entry
-                    last_end_epoch = end_epoch
-
-        if first_entry is None or last_entry is None:
-            return {
-                "first_entry": None,
-                "last_entry": None,
-                "first_start_epoch": None,
-                "last_end_epoch": None,
-                "in_window": False,
-            }
-
-        in_window = (first_start_epoch <= now_epoch < last_end_epoch)
-
-        return {
-            "first_entry": first_entry,
-            "last_entry": last_entry,
-            "first_start_epoch": first_start_epoch,
-            "last_end_epoch": last_end_epoch,
-            "in_window": in_window,
-        }
-
     def _relay_bool_to_state(self, value):
         if value is True:
             return "ON"
@@ -1365,9 +1200,12 @@ class EngineProcess(SettingsClient):
         self._pending_sync_request_id = req_id
 
         try:
-            self.relay_queue.put(Message("engine", "relay_status", {
-                "request_id": req_id
-            }))
+            self.relay_queue.put(Message(
+                "engine",
+                "relay_status",
+                {},
+                request_id=req_id
+            ))
         except Exception:
             pass
 
@@ -1461,6 +1299,11 @@ class EngineProcess(SettingsClient):
 
         print("[Engine] Started in mode: %s" % self.mode)
 
+        try:
+            self.db_queue.put(Message("engine", "request_settings_snapshot", {}))
+        except Exception:
+            pass
+
         ok = self.wait_for_initial_snapshot(timeout=3.0)
         if not ok:
             print("[Engine] No settings snapshot received yet; using defaults")
@@ -1493,12 +1336,72 @@ class EngineProcess(SettingsClient):
 
             self.db_queue.put(Message("engine", "heartbeat", {"status": "ok"}))
 
-            if self.current_temp is None:
-                print("[Engine] waiting for temperature... interval=%.2f" % self.engine_interval)
+            self._db_connect()
+
+            now_epoch = time.time()
+            temp_is_stale = self._is_temperature_stale(now_epoch)
+
+            if temp_is_stale:
+                stale_for = 0.0
+                try:
+                    last_update = float(self.last_temp_update_epoch or 0.0)
+                    if last_update > 0.0:
+                        stale_for = now_epoch - last_update
+                except Exception:
+                    stale_for = 0.0
+
+                if not self._temp_stale_active:
+                    self._temp_stale_active = True
+                    try:
+                        self.db_queue.put(Message("engine", "state_change", {
+                            "system": "CH",
+                            "state": "SENSOR_STALE"
+                        }))
+                    except Exception:
+                        pass
+
+                reason = "sensor_stale(%.0fs)" % stale_for
+                hw_reason = "sensor_stale_ignored"
+
+                print("[Engine] temperature stale for %.0fs - forcing CH OFF" % stale_for)
+
+                self._publish_state(None, "OFF", reason, (self.hw_desired == "ON"), hw_reason)
+
+                if self.ch_desired != "OFF":
+                    self.ch_desired = "OFF"
+                    self.ch_last_change_epoch = now_epoch
+                    self.ch_last_off_epoch = now_epoch
+
+                    try:
+                        self.db_queue.put(Message("engine", "set_setting", {
+                            "key": "CH_LAST_DESIRED",
+                            "value": "OFF"
+                        }))
+                    except Exception:
+                        pass
+
+                    try:
+                        self.db_queue.put(Message("engine", "state_change", {
+                            "system": "CH",
+                            "state": "DESIRED_OFF_SENSOR_STALE"
+                        }))
+                    except Exception:
+                        pass
+
+                    self._send_relay_desired(self._get_relay_letter("CH"), "OFF", "CH")
+
                 time.sleep(self.engine_interval)
                 continue
-
-            self._db_connect()
+            else:
+                if self._temp_stale_active:
+                    self._temp_stale_active = False
+                    try:
+                        self.db_queue.put(Message("engine", "state_change", {
+                            "system": "CH",
+                            "state": "SENSOR_OK"
+                        }))
+                    except Exception:
+                        pass
 
             now_epoch = time.time()
             dt = datetime.fromtimestamp(now_epoch)
@@ -1547,8 +1450,8 @@ class EngineProcess(SettingsClient):
 
             if target is None:
                 print("[Engine] temp=%.1fC CH=FORCED_OFF raw=%s (%s) band=%.1f switch=%s interval=%.2f" %
-                      (self.current_temp, desired_raw, reason, self.hysteresis_band, self.ch_system_switch,
-                       self.engine_interval))
+                      (self.current_temp, desired_raw, reason, self.hysteresis_band,
+                       self.ch_system_switch, self.engine_interval))
             else:
                 print("[Engine] temp=%.1fC target=%.1fC band=%.1f thr=[%.1f..%.1f] CH=%s raw=%s (%s) switch=%s interval=%.2f" %
                       (self.current_temp, target, self.hysteresis_band, lower, upper,

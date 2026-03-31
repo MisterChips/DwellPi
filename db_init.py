@@ -176,7 +176,7 @@ SETTINGS_SCHEMA = {
     "SENSOR_DEVICE_ID": {
         "default": "28-000007e4fecf",
         "type": "str",
-        "max_len": 16
+        "max_len": 32
     },
     #LCD Brightness settings
     "LCD_BRIGHTNESS": {
@@ -205,18 +205,6 @@ def _table_exists(cur, name):
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
     return cur.fetchone() is not None
 
-def _col_exists(cur, table, col):
-    cur.execute("PRAGMA table_info(%s)" % table)
-    for row in cur.fetchall():
-        # row = (cid, name, type, notnull, dflt_value, pk)
-        if row[1] == col:
-            return True
-    return False
-
-def _ts_text(epoch):
-    # local time, same vibe as legacy logs
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
-
 def ensure_overrides_and_schedules(conn):
     cur = conn.cursor()
 
@@ -234,12 +222,14 @@ def ensure_overrides_and_schedules(conn):
                 end_ts_epoch REAL NOT NULL,
                 end_ts_text TEXT NOT NULL,
                 systems TEXT NOT NULL,            -- 'CH', 'HW', or 'CH,HW'
-                enabled INTEGER NOT NULL DEFAULT 1,
-                note TEXT
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+                note TEXT,
+                CHECK (end_ts_epoch > start_ts_epoch)
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_away_enabled ON away_periods(enabled)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_away_time ON away_periods(start_ts_epoch, end_ts_epoch)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_away_enabled_time ON away_periods(enabled, start_ts_epoch, end_ts_epoch)")
 
     # -------------------------
     # Special Periods (override NORMAL weekly schedule)
@@ -257,12 +247,14 @@ def ensure_overrides_and_schedules(conn):
                 end_ts_text TEXT NOT NULL,
                 systems TEXT NOT NULL,            -- 'CH', 'HW', or 'CH,HW'
                 schedule_set_name TEXT NOT NULL,  -- e.g. 'CHRISTMAS'
-                enabled INTEGER NOT NULL DEFAULT 1,
-                note TEXT
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+                note TEXT,
+                CHECK (end_ts_epoch > start_ts_epoch)
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_special_enabled ON special_periods(enabled)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_special_time ON special_periods(start_ts_epoch, end_ts_epoch)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_special_enabled_time ON special_periods(enabled, start_ts_epoch, end_ts_epoch)")
 
     # -------------------------
     # Schedule Sets (named groups of weekly schedules)
@@ -272,8 +264,8 @@ def ensure_overrides_and_schedules(conn):
         print("[DB_INIT] Creating schedule_sets")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS schedule_sets (
-                name TEXT PRIMARY KEY,
-                enabled INTEGER NOT NULL DEFAULT 1,
+                name TEXT PRIMARY KEY CHECK (name <> ''),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
                 note TEXT
             )
         """)
@@ -288,13 +280,13 @@ def ensure_overrides_and_schedules(conn):
             CREATE TABLE IF NOT EXISTS schedule_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 schedule_set_name TEXT NOT NULL,
-                system TEXT NOT NULL,             -- 'CH' or 'HW'
-                days TEXT NOT NULL,               -- '0123456'
-                start_time TEXT NOT NULL,         -- 'HH:MM'
-                end_time TEXT NOT NULL,           -- 'HH:MM'
-                setpoint REAL,                    -- NULL allowed (HW)
-                warmup INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1,
+                system TEXT NOT NULL CHECK (system IN ('CH','HW')),   -- 'CH' or 'HW'
+                days TEXT NOT NULL,                                   -- '0123456'
+                start_time TEXT NOT NULL,                             -- 'HH:MM'
+                end_time TEXT NOT NULL,                               -- 'HH:MM'
+                setpoint REAL,                                        -- NULL allowed (HW)
+                warmup INTEGER NOT NULL DEFAULT 0 CHECK (warmup IN (0,1)),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
                 note TEXT,
                 FOREIGN KEY(schedule_set_name) REFERENCES schedule_sets(name)
             )
@@ -302,6 +294,8 @@ def ensure_overrides_and_schedules(conn):
         cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_lookup ON schedule_entries(schedule_set_name, system, enabled)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_days ON schedule_entries(days)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_times ON schedule_entries(start_time, end_time)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_set_system_start ON schedule_entries(schedule_set_name, system, start_time)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_system_enabled ON schedule_entries(system, enabled)")
 
     conn.commit()
 
@@ -366,39 +360,6 @@ def seed_default_schedule_sets(conn, seed_normal_entries=True):
 
     conn.commit()
 
-def is_valid(value, rule):
-
-    try:
-        if rule["type"] == "int":
-            int(value)
-
-        elif rule["type"] == "float":
-            float(value)
-
-        elif rule["type"] == "bool":
-            if value not in ["True", "False"]:
-                return False
-
-        elif rule["type"] == "enum":
-            if value not in rule["allowed"]:
-                return False
-
-        elif rule["type"] == "time":
-            parts = value.split(":")
-            if len(parts) != 2:
-                return False
-            hour = int(parts[0])
-            minute = int(parts[1])
-            if hour < 0 or hour > 23:
-                return False
-            if minute < 0 or minute > 59:
-                return False
-
-        return True
-
-    except:
-        return False
-
 def validate_setting(key, value, schema):
     try:
         setting_type = schema["type"]
@@ -447,8 +408,6 @@ def validate_setting(key, value, schema):
 
 
 def initialise_database(db_path):
-
-    db_exists = os.path.exists(db_path)
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
