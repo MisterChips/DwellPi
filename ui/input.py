@@ -54,6 +54,7 @@ def _select_program_by_id(ui_process, item_id):
 
     return False
 
+
 def _select_special_by_id(ui_process, item_id):
     if item_id is None:
         return False
@@ -94,6 +95,12 @@ def drain_ctrl_queue(ui_process):
         elif msg.type == "setting_changed":
             p = msg.payload or {}
             ui_process.apply_setting_changed(p.get("key"), p.get("value"))
+            continue
+
+        elif msg.type == "supervisor_status_result":
+            p = msg.payload or {}
+            ui_process.ui.supervisor_status = dict(p)
+            ui_process.ui.supervisor_status_updated = time.time()
             continue
 
         if msg.type == "programs_result":

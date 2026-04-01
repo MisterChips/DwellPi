@@ -7,7 +7,6 @@ import time
 from message_schema import Message
 from settings_sync import SettingsSyncMixin
 
-
 from ui.constants import (
     BUTTON_PINS,
     UI_MODE_MENU,
@@ -24,7 +23,6 @@ from ui.constants import (
     UI_MODE_SPECIAL_PROGRAM_EDIT,
     UI_MODE_HOLIDAY_PROGRAM_EDIT,
     UI_MODE_DATETIME_EDITOR,
-
 )
 
 from ui.state import UIState
@@ -48,14 +46,18 @@ from ui.datetime_editor import build_datetime_editor_lines
 
 
 class UIProcess(SettingsSyncMixin, object):
-    def __init__(self, ui_queue, ctrl_queue, db_queue, mode, shutdown_event):
+    def __init__(self, ui_queue, ctrl_queue, db_queue, supervisor_queue, mode, shutdown_event):
         self.ui_queue = ui_queue
         self.ctrl_queue = ctrl_queue
         self.db_queue = db_queue
+        self.supervisor_queue = supervisor_queue
         self.mode = mode
         self.shutdown_event = shutdown_event
 
         self.ui = UIState()
+        self.ui.supervisor_status = {}
+        self.ui.supervisor_status_updated = 0.0
+
         self.lcd = None
         self.display = None
         self.actions = None
@@ -89,25 +91,33 @@ class UIProcess(SettingsSyncMixin, object):
         return self.ui.settings.values
 
     def _on_setting_changed(self, key, value):
+        brightness_related = False
+
         if key == "LCD_BRIGHTNESS":
             self.ui.settings.lcd_brightness = int(float(value))
-            self._apply_lcd_brightness_if_needed(force=True)
+            brightness_related = True
 
         elif key == "LCD_DIM_LEVEL":
             self.ui.settings.lcd_dim_level = int(float(value))
-            self._apply_lcd_brightness_if_needed(force=True)
+            brightness_related = True
 
         elif key == "LCD_DIM_START_TIME":
             self.ui.settings.lcd_dim_start_time = str(value or "00:00")
-            self._apply_lcd_brightness_if_needed(force=True)
+            brightness_related = True
 
         elif key == "LCD_DIM_END_TIME":
             self.ui.settings.lcd_dim_end_time = str(value or "00:00")
-            self._apply_lcd_brightness_if_needed(force=True)
+            brightness_related = True
+
+        if brightness_related:
+            self._apply_lcd_brightness_if_needed(force=False)
+
+    def _on_settings_snapshot_applied(self, values):
+        self._apply_lcd_brightness_if_needed(force=True)
 
     def _setup_helpers(self):
         self.display = DisplayHelper(self.lcd)
-        self.actions = UIActions(self.db_queue, self.ui.settings.values)
+        self.actions = UIActions(self.db_queue, self.ui.settings.values, self.supervisor_queue)
         self.controller = UIController(self)
 
     def _log_ui_action(self, text):
@@ -151,7 +161,7 @@ class UIProcess(SettingsSyncMixin, object):
     def _handle_button(self, name):
         handle_button(self, name)
 
-    def _build_display(self):
+    def _build_lines(self):
         if self.ui.mode == UI_MODE_MENU:
             self.ui.lines = build_menu_lines(self.ui, self.display)
         elif self.ui.mode == UI_MODE_STATUS:
@@ -205,6 +215,7 @@ class UIProcess(SettingsSyncMixin, object):
         print("[UI] Started in mode: %s" % self.mode)
         last_brightness_check = 0.0
         last_hb = 0.0
+        last_supervisor_request = 0.0
 
         try:
             ui_input.init_gpio(BUTTON_PINS, self.last_button_state)
@@ -222,7 +233,8 @@ class UIProcess(SettingsSyncMixin, object):
         if not ok:
             print("[UI] No settings snapshot received yet; using defaults")
 
-        self._apply_lcd_brightness_if_needed(force=True)
+        if not ok:
+            self._apply_lcd_brightness_if_needed(force=True)
 
         while not self.shutdown_event.is_set():
             now = time.time()
@@ -231,11 +243,14 @@ class UIProcess(SettingsSyncMixin, object):
             ui_input.drain_ui_queue(self)
             ui_input.poll_buttons(self, BUTTON_PINS, self.last_button_state)
 
-            self.controller.update_ui_timers()
-            self._build_display()
-            self._render_if_changed()
+            if self.ui.mode == UI_MODE_STATUS:
+                if (now - last_supervisor_request) >= 5.0:
+                    self.actions.request_supervisor_status()
+                    last_supervisor_request = now
 
-            now = time.time()
+            self.controller.update_ui_timers()
+            self._build_lines()
+            self._render_if_changed()
 
             if now - last_brightness_check >= 30.0:
                 self._apply_lcd_brightness_if_needed(force=False)

@@ -16,28 +16,15 @@ class _NoOpLock(object):
 
 class SettingsSyncMixin(object):
     def _settings_store(self):
-        """
-        Must return the dict used to store raw settings.
-        Example:
-            return self.ui.settings.values
-        or:
-            return self.settings
-        """
         raise NotImplementedError
 
     def _settings_lock(self):
-        """
-        Optional hook for a lock protecting the settings store.
-        Subclasses can override to return a real lock.
-        """
         return _NoOpLock()
 
     def _on_setting_changed(self, key, value):
-        """
-        Optional hook for process-specific side effects.
-        UI can react to LCD brightness changes here.
-        Web can usually leave this alone.
-        """
+        pass
+
+    def _on_settings_snapshot_applied(self, values):
         pass
 
     def apply_settings_snapshot(self, values):
@@ -51,6 +38,8 @@ class SettingsSyncMixin(object):
 
             for key, value in values.items():
                 self._on_setting_changed(key, value)
+
+            self._on_settings_snapshot_applied(values)
         except Exception as e:
             print("[SettingsSync] Failed to apply snapshot: %s" % e)
 

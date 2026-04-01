@@ -4,6 +4,7 @@
 
 import time
 
+
 class LiveState(object):
     def __init__(self):
         self.temp = None
@@ -97,6 +98,7 @@ class ProgramsState(object):
         self.action_index = 0
         self.preferred_selected_id = None
 
+
 class SpecialPeriodsState(object):
     def __init__(self):
         self.items = []
@@ -118,6 +120,7 @@ class HolidaysState(object):
         self.details_page = 0
         self.preferred_selected_id = None
 
+
 class ProgramEditState(object):
     def __init__(self):
         self.active = False
@@ -137,11 +140,13 @@ class ProgramEditState(object):
 
         self.field_index = 0
 
+
 class DaysEditorState(object):
     def __init__(self):
         self.active = False
         self.cursor = 0
         self.values = [True, True, True, True, True, True, True]
+
 
 class SpecialEditState(object):
     def __init__(self):
@@ -174,6 +179,7 @@ class HolidayEditState(object):
         self.note = ""
 
         self.field_index = 0
+
 
 class DateTimeEditorState(object):
     def __init__(self):
@@ -209,3 +215,7 @@ class UIState(object):
         self.special_edit = SpecialEditState()
         self.holiday_edit = HolidayEditState()
         self.datetime_editor = DateTimeEditorState()
+
+        # supervisor/watchdog/debug snapshot
+        self.supervisor_status = {}
+        self.supervisor_status_updated = 0.0

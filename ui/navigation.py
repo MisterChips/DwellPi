@@ -1417,7 +1417,7 @@ def handle_status_button(ui_process, name):
         return
 
     if name in ("down", "enter", "right"):
-        ui_process.ui.status.page_index = (ui_process.ui.status.page_index + 1) % 4
+        ui_process.ui.status.page_index = (ui_process.ui.status.page_index + 1) % 5
         ui_process.ui.scroll.pos = 0
         ui_process.ui.scroll.last_time = 0.0
         return

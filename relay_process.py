@@ -133,7 +133,7 @@ class RelayController(object):
             ))
             return self.sim_status[relay_letter]
 
-    def get_status(self):
+    def get_status(self, log_raw=False):
         if self.mode == "PRODUCTION":
             if not self.rb:
                 return {"A": None, "B": None}
@@ -142,7 +142,9 @@ class RelayController(object):
             time.sleep(0.15)
             b = self._read_relay_status_with_retry(self.rb.relay_b, "B")
 
-            print("[Relay] get_status raw: A=%r B=%r" % (a, b))
+            if log_raw:
+                print("[Relay] get_status raw: A=%r B=%r" % (a, b))
+
             return {"A": a, "B": b}
 
         return dict(self.sim_status)
@@ -234,25 +236,20 @@ class RelayProcess(SettingsClient):
 
         self.ctrl = RelayController(mode, relay_device_id=self.relay_device_id)
 
-    def _publish_ui_state(self):
+    def _publish_state(self, st=None):
         try:
-            st = self.ctrl.get_status()
-            self.ui_queue.put(Message("relay", "ui_state", {
-                "relay_a": st["A"],
-                "relay_b": st["B"]
-            }))
-        except Exception as e:
-            print("[Relay] _publish_ui_state failed: %s" % e)
+            if st is None:
+                st = self.ctrl.get_status()
 
-    def _publish_web_state(self):
-        try:
-            st = self.ctrl.get_status()
-            self.web_queue.put(Message("relay", "web_state", {
-                "relay_a": st["A"],
-                "relay_b": st["B"]
-            }))
+            payload = {
+                "relay_a": st.get("A"),
+                "relay_b": st.get("B")
+            }
+
+            self.ui_queue.put(Message("relay", "ui_state", payload))
+            self.web_queue.put(Message("relay", "web_state", payload))
         except Exception as e:
-            print("[Relay] _publish_web_state failed: %s" % e)
+            print("[Relay] _publish_state failed: %s" % e)
 
     def _apply_setting_changed(self, key, value):
         if key == "RELAY_BOARD_DEVICE_ID":
@@ -292,6 +289,17 @@ class RelayProcess(SettingsClient):
 
         elif key == "RELAY_ENABLE":
             self.relay_enable = parse_bool(value)
+
+    def _build_status_snapshot_after_change(self, relay_letter, status):
+        relay_letter = str(relay_letter or "").upper()
+
+        if self.mode == "TEST":
+            return dict(self.ctrl.sim_status)
+
+        st = self.ctrl.get_status()
+        if relay_letter in ("A", "B"):
+            st[relay_letter] = status
+        return st
 
     def _fmt_status(self, value):
         if value is True:
@@ -334,13 +342,11 @@ class RelayProcess(SettingsClient):
             print("[Relay] Hardware disabled; LLAP will not start yet")
 
         try:
-            _ = self.ctrl.get_status()
+            st = self.ctrl.get_status(log_raw=True)
             print("[Relay] Initial relay status read attempted")
+            self._publish_state(st)
         except Exception as e:
             print("[Relay] Initial relay status read failed: %s" % e)
-
-        self._publish_ui_state()
-        self._publish_web_state()
 
         last_hb = 0.0
 
@@ -356,8 +362,7 @@ class RelayProcess(SettingsClient):
                         self.ctrl.relay_device_id = self.relay_device_id
                         try:
                             self.ctrl.start()
-                            self._publish_ui_state()
-                            self._publish_web_state()
+                            self._publish_state()
                         except Exception as e:
                             print("[Relay] Failed to start LLAP: %s" % e)
                             try:
@@ -372,8 +377,7 @@ class RelayProcess(SettingsClient):
                         print("[Relay] RELAY_ENABLE=False -> stopping LLAP")
                         try:
                             self.ctrl.stop()
-                            self._publish_ui_state()
-                            self._publish_web_state()
+                            self._publish_state()
                         except Exception as e:
                             print("[Relay] Failed to stop LLAP: %s" % e)
 
@@ -419,8 +423,8 @@ class RelayProcess(SettingsClient):
                             continue
 
                         status = self.ctrl.set_relay(relay, on)
-                        self._publish_ui_state()
-                        self._publish_web_state()
+                        st = self._build_status_snapshot_after_change(relay, status)
+                        self._publish_state(st)
 
                         fmt = self._fmt_status(status)
 
@@ -446,8 +450,8 @@ class RelayProcess(SettingsClient):
                             continue
 
                         status = self.ctrl.toggle_relay(relay)
-                        self._publish_ui_state()
-                        self._publish_web_state()
+                        st = self._build_status_snapshot_after_change(relay, status)
+                        self._publish_state(st)
 
                         fmt = self._fmt_status(status)
 
@@ -477,8 +481,7 @@ class RelayProcess(SettingsClient):
                         print("[Relay] status A=%s B=%s" %
                               (self._fmt_status(st["A"]), self._fmt_status(st["B"])))
 
-                        self._publish_ui_state()
-                        self._publish_web_state()
+                        self._publish_state(st)
 
                         reply_msg = Message(
                             "relay",

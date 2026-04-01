@@ -7,9 +7,10 @@ from message_schema import Message
 
 
 class UIActions(object):
-    def __init__(self, db_queue, settings_dict):
+    def __init__(self, db_queue, settings_dict, supervisor_queue=None):
         self.db_queue = db_queue
         self.settings = settings_dict
+        self.supervisor_queue = supervisor_queue
 
     def set_setting(self, key, value):
         try:
@@ -254,3 +255,13 @@ class UIActions(object):
 
     def request_reboot_pi(self):
         return self.request_system_action("reboot_pi")
+
+    def request_supervisor_status(self):
+        if self.supervisor_queue is None:
+            return False
+
+        try:
+            self.supervisor_queue.put(Message("ui", "get_supervisor_status", {}))
+            return True
+        except Exception:
+            return False

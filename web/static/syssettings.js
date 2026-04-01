@@ -43,7 +43,6 @@ async function saveSettings(onlyLcd = false) {
         const result = await postBulkSettings(buildPayload(list));
         if (result.ok) {
             setStatus("Settings saved successfully.");
-            // No need to reload from server; the UI already has the values
         } else {
             setStatus("Save failed: " + (result.error || "unknown error"));
         }
@@ -84,17 +83,15 @@ async function loadSysSettingsStatus() {
 
         const settings = data.settings || {};
 
-        // Loop through your Master List to populate the UI
         ALL_SYSTEM_SETTINGS.forEach(item => {
             const val = settings[item.key];
-
-            // Use the value from DB, or the default from our list, or an empty string
             const finalVal = (val !== undefined && val !== null)
                 ? val
                 : (item.default || "");
 
             setValue(item.id, finalVal);
         });
+        updateSupervisorPanel(data.supervisor || {});
 
         setStatus("System settings loaded.");
     } catch (e) {
@@ -169,10 +166,113 @@ async function loadRelayInfo() {
     }
 }
 
+function fmtAgeSeconds(value) {
+    if (value === null || value === undefined || isNaN(value)) return "--";
+    return Math.round(Number(value)) + "s";
+}
+
+function fmtRestartCount(value) {
+    if (value === null || value === undefined || isNaN(value)) return "0";
+    return String(parseInt(value, 10));
+}
+
+function aliveText(flag) {
+    return flag ? "UP" : "DN";
+}
+
+function dbReadyText(flag) {
+    return flag ? "OK" : "WAIT";
+}
+
+async function loadSupervisorStatus() {
+    try {
+        const r = await fetch("/api/status");
+        const data = await r.json();
+
+        if (!data.ok) {
+            setStatus("Failed to load supervisor status");
+            return;
+        }
+
+        updateSupervisorPanel(data.supervisor || {});
+    } catch (e) {
+        console.log("loadSupervisorStatus failed", e);
+        setStatus("Error loading supervisor status");
+    }
+}
+
+function updateSupervisorPanel(wrapper) {
+    var sup = (wrapper && wrapper.data) ? wrapper.data : {};
+    var procs = sup.processes || {};
+
+    var nowSec = Date.now() / 1000;
+    var updatedAge = "--";
+    var ts = parseFloat(sup.timestamp || 0);
+    if (!isNaN(ts) && ts > 0) {
+        updatedAge = fmtAgeSeconds(nowSec - ts);
+    }
+
+    setText("supervisor-mode", "Mode: " + (sup.mode || "--"));
+    setText("supervisor-db-ready", "DB Ready: " + dbReadyText(!!sup.db_ready));
+    setText("supervisor-updated-age", "Last Update: " + updatedAge);
+
+    function processSummary(name, p) {
+        p = p || {};
+        return (
+            name +
+            ": " + aliveText(!!p.alive) +
+            " | hb " + fmtAgeSeconds(p.heartbeat_age) +
+            " | restarts " + fmtRestartCount(p.restart_count)
+        );
+    }
+
+    setText("supervisor-engine", processSummary("Engine", procs.engine));
+    setText("supervisor-sensor", processSummary("Sensor", procs.sensor));
+    setText("supervisor-relay", processSummary("Relay", procs.relay));
+    setText("supervisor-ui", processSummary("UI", procs.ui));
+    setText("supervisor-web", processSummary("Web", procs.web));
+
+    var db = procs.db || {};
+    setText(
+        "supervisor-db",
+        "DB: " + aliveText(!!db.alive) +
+        " | restarts " + fmtRestartCount(db.restart_count)
+    );
+}
+
+async function restartProcess(name) {
+    setStatus("Requesting " + name + " restart...");
+
+    try {
+        const r = await fetch("/api/system/restart_process", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: name })
+        });
+
+        const data = await r.json();
+
+        if (data.ok) {
+            if (data.was_running === false) {
+                setStatus(name + " was already stopped. Started fresh.");
+            } else {
+                setStatus(name + " restarted.");
+            }
+            setTimeout(loadSupervisorStatus, 1000);
+        } else {
+            setStatus("Restart failed: " + (data.error || "unknown error"));
+        }
+    } catch (e) {
+        console.log("restartProcess failed", e);
+        setStatus("Network error requesting process restart.");
+    }
+}
+
 window.addEventListener("DOMContentLoaded", function () {
     loadSysSettingsStatus();
     loadSystemLoadInfo();
     loadRelayInfo();
+    setInterval(loadSupervisorStatus, 5000);
 
     bindClick("bt-syssettings-save", () => saveSettings(false));
     bindClick("bt-save-lcd-settings", () => saveSettings(true));
@@ -206,5 +306,36 @@ window.addEventListener("DOMContentLoaded", function () {
     bindClick("bt-reboot-pi", async () => {
         if (!window.confirm("Reboot Raspberry Pi now?")) return;
         await postSystemAction("/api/system/reboot_pi", "Requesting Raspberry Pi reboot...", "Raspberry Pi reboot requested.");
+    });
+
+    bindClick("bt-refresh-supervisor", async () => {
+        setStatus("Refreshing supervisor status...");
+        await loadSupervisorStatus();
+        setStatus("Supervisor status refreshed.");
+    });
+
+    bindClick("bt-restart-engine", async () => {
+        if (!window.confirm("Restart Engine now?")) return;
+        await restartProcess("engine");
+    });
+
+    bindClick("bt-restart-sensor", async () => {
+        if (!window.confirm("Restart Sensor now?")) return;
+        await restartProcess("sensor");
+    });
+
+    bindClick("bt-restart-relay", async () => {
+        if (!window.confirm("Restart Relay now?")) return;
+        await restartProcess("relay");
+    });
+
+    bindClick("bt-restart-ui", async () => {
+        if (!window.confirm("Restart UI now?")) return;
+        await restartProcess("ui");
+    });
+
+    bindClick("bt-restart-web", async () => {
+        if (!window.confirm("Restart Web now?")) return;
+        await restartProcess("web");
     });
 });

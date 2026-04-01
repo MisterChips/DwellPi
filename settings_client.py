@@ -20,8 +20,9 @@ class SettingsClient(object):
       _apply_setting_changed(key, value)
 
     Optional:
-      _on_settings_snapshot(values_dict)
-      _on_unknown_ctrl_message(msg)
+  _on_settings_snapshot_applied(values_dict)   # preferred
+  _on_settings_snapshot(values_dict)           # legacy fallback
+  _on_unknown_ctrl_message(msg)
     """
 
     def __init__(self, ctrl_queue, shutdown_event, name="Process"):
@@ -42,7 +43,10 @@ class SettingsClient(object):
             except Exception:
                 pass
 
-        hook = getattr(self, "_on_settings_snapshot", None)
+        hook = getattr(self, "_on_settings_snapshot_applied", None)
+        if not hook:
+            hook = getattr(self, "_on_settings_snapshot", None)
+
         if hook:
             try:
                 hook(values_dict)

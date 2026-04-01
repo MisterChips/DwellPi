@@ -70,12 +70,13 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 class WebProcess(SettingsSyncMixin, object):
     def __init__(self, web_queue, ctrl_queue, db_queue, relay_queue, web_rpc_queue,
-                 mode, db_path, shutdown_event):
+                 supervisor_queue, mode, db_path, shutdown_event):
         self.web_queue = web_queue
         self.ctrl_queue = ctrl_queue
         self.db_queue = db_queue
         self.relay_queue = relay_queue
         self.web_rpc_queue = web_rpc_queue
+        self.supervisor_queue = supervisor_queue
         self.mode = mode
         self.db_path = db_path
         self.shutdown_event = shutdown_event
@@ -100,6 +101,10 @@ class WebProcess(SettingsSyncMixin, object):
             "updated": 0,
         }
         self.state_lock = threading.Lock()
+
+        self.supervisor_status = {}
+        self.supervisor_status_lock = threading.Lock()
+        self.supervisor_status_updated = 0.0
 
     def _rpc_db(self, msg_type, payload, timeout=2.0):
         import uuid
@@ -173,6 +178,49 @@ class WebProcess(SettingsSyncMixin, object):
 
         return None
 
+    def _request_supervisor_status(self):
+        if self.supervisor_queue is None:
+            return False
+
+        try:
+            self.supervisor_queue.put(Message("web", "get_supervisor_status", {}))
+            return True
+        except Exception:
+            return False
+
+    def _rpc_supervisor(self, msg_type, payload, timeout=5.0):
+        import uuid
+
+        if self.supervisor_queue is None:
+            return None
+
+        request_id = uuid.uuid4().hex
+
+        with self.pending_replies_lock:
+            self.pending_replies.pop(request_id, None)
+
+        try:
+            self.supervisor_queue.put(Message(
+                "web",
+                msg_type,
+                payload or {},
+                request_id=request_id
+            ))
+        except Exception:
+            return None
+
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self.shutdown_event.is_set():
+            with self.pending_replies_lock:
+                reply = self.pending_replies.pop(request_id, None)
+
+            if reply is not None:
+                return reply
+
+            time.sleep(0.01)
+
+        return None
+
     def _drain_ctrl_queue(self):
         while True:
             try:
@@ -187,6 +235,13 @@ class WebProcess(SettingsSyncMixin, object):
             if msg.type == "setting_changed":
                 p = msg.payload or {}
                 self.apply_setting_changed(p.get("key"), p.get("value"))
+                continue
+
+            if msg.type == "supervisor_status_result":
+                payload = dict(msg.payload or {})
+                with self.supervisor_status_lock:
+                    self.supervisor_status = payload
+                    self.supervisor_status_updated = payload.get("timestamp", time.time())
                 continue
 
             if getattr(msg, "request_id", None):
@@ -327,6 +382,13 @@ class WebProcess(SettingsSyncMixin, object):
         with self.state_lock:
             return dict(self.state)
 
+    def _get_supervisor_status_snapshot(self):
+        with self.supervisor_status_lock:
+            return {
+                "data": dict(self.supervisor_status),
+                "updated": self.supervisor_status_updated
+            }
+
     def _make_handler(self):
         outer = self
 
@@ -462,7 +524,8 @@ class WebProcess(SettingsSyncMixin, object):
                         "ok": True,
                         "mode": outer.mode,
                         "state": outer._get_state_snapshot(),
-                        "settings": outer._get_settings_snapshot()
+                        "settings": outer._get_settings_snapshot(),
+                        "supervisor": outer._get_supervisor_status_snapshot()
                     })
                     return
 
@@ -657,6 +720,20 @@ class WebProcess(SettingsSyncMixin, object):
 
                     if parsed.path == "/api/system/reboot_pi":
                         self._db_post("request_system_action", {"action": "reboot_pi"}, timeout=5.0)
+                        return
+
+                    if parsed.path == "/api/system/restart_process":
+                        body = self._read_body_or_400(raw_body)
+                        if body is None:
+                            return
+
+                        proc_name = str(body.get("name") or "").strip().lower()
+                        msg = outer._rpc_supervisor("restart_process", {"name": proc_name}, timeout=5.0)
+
+                        if msg is None:
+                            self._send_json(504, {"ok": False, "error": "Supervisor timeout"})
+                        else:
+                            self._send_json(200, msg.payload or {"ok": False, "error": "Empty supervisor reply"})
                         return
 
                     db_post_routes = {
@@ -869,6 +946,7 @@ class WebProcess(SettingsSyncMixin, object):
         server.timeout = 1.0
 
         last_hb = 0.0
+        last_supervisor_request = 0.0
 
         try:
             while not self.shutdown_event.is_set():
@@ -877,6 +955,11 @@ class WebProcess(SettingsSyncMixin, object):
                 self._drain_web_rpc_queue()
 
                 now = time.time()
+
+                if now - last_supervisor_request >= 5.0:
+                    self._request_supervisor_status()
+                    last_supervisor_request = now
+
                 if now - last_hb >= 5.0:
                     try:
                         self.db_queue.put(Message("web", "heartbeat", {"status": "ok"}))
