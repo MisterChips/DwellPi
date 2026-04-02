@@ -36,7 +36,7 @@
             </section>
 
             <section class="panel">
-                <div class="panel-title">Warmup / Predictive Heating</div>
+                <div class="panel-title">Warmup / Predictive Warmup</div>
                 <div class="panel-body settings-stack">
 
                     <div class="form-row">
@@ -121,7 +121,8 @@
 
                     <div class="minor-status">
                         Used only for heating programs where Warmup is enabled.
-                        Predictive heating blends historical and live measured heat-up rate to start heating earlier.
+                        Predictive Warmup learns from real heat-up performance and starts heating early.
+                        Fallback Heatup Rate is used if there is not yet enough live learning data, or if predictive warmup is disabled.
                     </div>
                 </div>
             </section>
