@@ -1,0 +1,7 @@
+EMAIL_TO=youraddress@example.com
+EMAIL_FROM=youraddress@example.com
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=yourusername
+SMTP_PASSWORD=yourpassword
+SMTP_USE_SSL=True

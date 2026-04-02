@@ -17,6 +17,7 @@ from sensor_process import SensorProcess
 from relay_process import RelayProcess
 from ui_process import UIProcess
 from web_process import WebProcess
+from email_process import EmailProcess
 from message_schema import Message
 from rpc_server import RpcServer
 
@@ -37,8 +38,23 @@ HEARTBEAT_TIMEOUT_SENSOR = 20
 HEARTBEAT_TIMEOUT_RELAY = 20
 HEARTBEAT_TIMEOUT_UI = 20
 HEARTBEAT_TIMEOUT_WEB = 20
+HEARTBEAT_TIMEOUT_EMAIL = 20
 
 PROCESS_START_GRACE = 20
+
+
+def _send_supervisor_email_alert(email_queue, alert_key, event, body, severity="error", extra=None):
+    try:
+        email_queue.put(Message("supervisor", "email_alert", {
+            "alert_key": alert_key,
+            "subsystem": "SUPERVISOR",
+            "event": event,
+            "severity": severity,
+            "body": body,
+            "extra": extra or {}
+        }))
+    except Exception:
+        pass
 
 
 def handle_sigterm(signum, frame):
@@ -57,8 +73,8 @@ def log_supervisor_state(db_queue, system, state):
 
 
 def start_db(db_path, mode, db_queue, engine_ctrl_queue, sensor_ctrl_queue,
-             relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue,
-             supervisor_queue, shutdown_event):
+             relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue,
+             email_queue, supervisor_queue, shutdown_event):
     db_worker = DBWorker(db_path, mode)
     p = multiprocessing.Process(
         target=db_worker.run,
@@ -69,6 +85,8 @@ def start_db(db_path, mode, db_queue, engine_ctrl_queue, sensor_ctrl_queue,
             relay_ctrl_queue,
             ui_ctrl_queue,
             web_ctrl_queue,
+            email_ctrl_queue,
+            email_queue,
             supervisor_queue,
             shutdown_event,
         )
@@ -78,7 +96,7 @@ def start_db(db_path, mode, db_queue, engine_ctrl_queue, sensor_ctrl_queue,
 
 
 def start_engine(engine_queue, engine_rpc_queue, ui_queue, web_queue,
-                 db_queue, engine_ctrl_queue, relay_queue, mode,
+                 db_queue, engine_ctrl_queue, relay_queue, email_queue, mode,
                  db_path, shutdown_event):
     engine_obj = EngineProcess(
         engine_queue,
@@ -88,6 +106,7 @@ def start_engine(engine_queue, engine_rpc_queue, ui_queue, web_queue,
         db_queue,
         engine_ctrl_queue,
         relay_queue,
+        email_queue,
         mode,
         db_path,
         shutdown_event
@@ -98,9 +117,9 @@ def start_engine(engine_queue, engine_rpc_queue, ui_queue, web_queue,
 
 
 def start_sensor(engine_queue, db_queue, sensor_ctrl_queue, ui_queue,
-                 web_queue, mode, shutdown_event):
+                 web_queue, email_queue, mode, shutdown_event):
     sensor_obj = SensorProcess(
-        engine_queue, db_queue, sensor_ctrl_queue, ui_queue, web_queue, mode, shutdown_event
+        engine_queue, db_queue, sensor_ctrl_queue, ui_queue, web_queue, email_queue, mode, shutdown_event
     )
     p = multiprocessing.Process(target=sensor_obj.run)
     p.start()
@@ -108,7 +127,7 @@ def start_sensor(engine_queue, db_queue, sensor_ctrl_queue, ui_queue,
 
 
 def start_relay(relay_queue, db_queue, relay_ctrl_queue, ui_queue, web_queue,
-                rpc_reply_queue, engine_rpc_queue, web_rpc_queue,
+                rpc_reply_queue, engine_rpc_queue, web_rpc_queue, email_queue,
                 mode, shutdown_event):
     relay_obj = RelayProcess(
         relay_queue,
@@ -120,7 +139,8 @@ def start_relay(relay_queue, db_queue, relay_ctrl_queue, ui_queue, web_queue,
         shutdown_event,
         rpc_reply_queue=rpc_reply_queue,
         engine_rpc_queue=engine_rpc_queue,
-        web_rpc_queue=web_rpc_queue
+        web_rpc_queue=web_rpc_queue,
+        email_queue=email_queue
     )
     p = multiprocessing.Process(target=relay_obj.run)
     p.start()
@@ -135,19 +155,26 @@ def start_ui(ui_queue, ui_ctrl_queue, db_queue, supervisor_request_queue, mode, 
 
 
 def start_web(web_queue, web_ctrl_queue, db_queue, relay_queue, web_rpc_queue,
-              supervisor_queue, mode, db_path, shutdown_event):
+              supervisor_request_queue, email_queue, mode, db_path, shutdown_event):
     web_obj = WebProcess(
         web_queue,
         web_ctrl_queue,
         db_queue,
         relay_queue,
         web_rpc_queue,
-        supervisor_queue,
+        supervisor_request_queue,
+        email_queue,
         mode,
         db_path,
         shutdown_event
     )
     p = multiprocessing.Process(target=web_obj.run)
+    p.start()
+    return p
+
+def start_email(email_queue, db_queue, email_ctrl_queue, mode, shutdown_event):
+    email_obj = EmailProcess(email_queue, db_queue, email_ctrl_queue, mode, shutdown_event)
+    p = multiprocessing.Process(target=email_obj.run)
     p.start()
     return p
 
@@ -184,10 +211,12 @@ def _safe_is_alive(proc):
     return proc is not None and proc.is_alive()
 
 
-def _mark_started(name, last_started, restart_counts):
+def _mark_started(name, last_started, restart_counts, restart_history=None):
     now = time.time()
     last_started[name] = now
     restart_counts[name] += 1
+    if restart_history is not None:
+        restart_history.setdefault(name, []).append(now)
     return now
 
 
@@ -254,6 +283,7 @@ def _build_supervisor_status(mode, db_path, db_ready, procs, last_hb, last_start
             "relay": _build_process_status("relay", procs.get("relay"), last_hb, last_started, restart_counts, HEARTBEAT_TIMEOUT_RELAY, now),
             "ui": _build_process_status("ui", procs.get("ui"), last_hb, last_started, restart_counts, HEARTBEAT_TIMEOUT_UI, now),
             "web": _build_process_status("web", procs.get("web"), last_hb, last_started, restart_counts, HEARTBEAT_TIMEOUT_WEB, now),
+            "email": _build_process_status("email", procs.get("email"), last_hb, last_started, restart_counts, HEARTBEAT_TIMEOUT_EMAIL, now),
         }
     }
 
@@ -292,36 +322,45 @@ if __name__ == "__main__":
     ui_queue = multiprocessing.Queue()
     web_queue = multiprocessing.Queue()
     web_ctrl_queue = multiprocessing.Queue()
+    email_queue = multiprocessing.Queue()
+    email_ctrl_queue = multiprocessing.Queue()
 
     engine_process = None
     sensor_process = None
     relay_process = None
     ui_process = None
     web_process = None
+    email_process = None
     db_process = None
     rpc = None
 
     initialise_database(DB_PATH)
 
     last_restart = {
-        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0, "db": 0
+        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0, "email": 0, "db": 0
     }
     last_hb = {
-        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0
+        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0, "email": 0
     }
     last_started = {
-        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0, "db": 0
+        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0, "email": 0, "db": 0
     }
     restart_counts = {
-        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0, "db": 0
+        "engine": 0, "sensor": 0, "relay": 0, "ui": 0, "web": 0, "email": 0, "db": 0
+    }
+    restart_history = {
+        "engine": [], "sensor": [], "relay": [], "ui": [], "web": [], "email": [], "db": []
+    }
+    restart_storm_alerted = {
+        "engine": False, "sensor": False, "relay": False, "ui": False, "web": False, "email": False, "db": False
     }
 
     db_process = start_db(
         DB_PATH, MODE, db_queue, engine_ctrl_queue, sensor_ctrl_queue,
-        relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue,
-        supervisor_queue, shutdown_event
+        relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue,
+        email_queue, supervisor_queue, shutdown_event
     )
-    _mark_started("db", last_started, restart_counts)
+    _mark_started("db", last_started, restart_counts, restart_history)
 
     db_ready = wait_for_db_ready(supervisor_queue, shutdown_event, timeout=5.0)
 
@@ -330,31 +369,36 @@ if __name__ == "__main__":
     else:
         relay_process = start_relay(
             relay_queue, db_queue, relay_ctrl_queue, ui_queue, web_queue,
-            rpc_reply_queue, engine_rpc_queue, web_rpc_queue, MODE, shutdown_event
+            rpc_reply_queue, engine_rpc_queue, web_rpc_queue, email_queue, MODE, shutdown_event
         )
-        _mark_started("relay", last_started, restart_counts)
+        _mark_started("relay", last_started, restart_counts, restart_history)
 
         engine_process = start_engine(
             engine_queue, engine_rpc_queue, ui_queue, web_queue,
-            db_queue, engine_ctrl_queue, relay_queue, MODE, DB_PATH, shutdown_event
+            db_queue, engine_ctrl_queue, relay_queue, email_queue, MODE, DB_PATH, shutdown_event
         )
-        _mark_started("engine", last_started, restart_counts)
+        _mark_started("engine", last_started, restart_counts, restart_history)
 
         sensor_process = start_sensor(
-            engine_queue, db_queue, sensor_ctrl_queue, ui_queue, web_queue, MODE, shutdown_event
+            engine_queue, db_queue, sensor_ctrl_queue, ui_queue, web_queue, email_queue, MODE, shutdown_event
         )
-        _mark_started("sensor", last_started, restart_counts)
+        _mark_started("sensor", last_started, restart_counts, restart_history)
 
         ui_process = start_ui(
             ui_queue, ui_ctrl_queue, db_queue, supervisor_request_queue, MODE, shutdown_event
         )
-        _mark_started("ui", last_started, restart_counts)
+        _mark_started("ui", last_started, restart_counts, restart_history)
 
         web_process = start_web(
             web_queue, web_ctrl_queue, db_queue, relay_queue, web_rpc_queue,
-            supervisor_request_queue, MODE, DB_PATH, shutdown_event
+            supervisor_request_queue, email_queue, MODE, DB_PATH, shutdown_event
         )
-        _mark_started("web", last_started, restart_counts)
+        _mark_started("web", last_started, restart_counts, restart_history)
+
+        email_process = start_email(
+            email_queue, db_queue, email_ctrl_queue, MODE, shutdown_event
+        )
+        _mark_started("email", last_started, restart_counts, restart_history)
 
     rpc = RpcServer("/tmp/dwellpi.sock", relay_queue, rpc_reply_queue, ui_queue, shutdown_event)
     rpc.start()
@@ -370,6 +414,7 @@ if __name__ == "__main__":
             relay_restarted_this_tick = False
             ui_restarted_this_tick = False
             web_restarted_this_tick = False
+            email_restarted_this_tick = False
 
             while True:
                 try:
@@ -413,6 +458,7 @@ if __name__ == "__main__":
                             "relay": relay_process,
                             "ui": ui_process,
                             "web": web_process,
+                            "email": email_process,
                         },
                         last_hb,
                         last_started,
@@ -440,7 +486,7 @@ if __name__ == "__main__":
                     if reply_q is None:
                         continue
 
-                    allowed = ("engine", "sensor", "relay", "ui", "web")
+                    allowed = ("engine", "sensor", "relay", "ui", "web", "email")
                     if proc_name not in allowed:
                         try:
                             reply_q.put(Message(
@@ -497,6 +543,14 @@ if __name__ == "__main__":
                             last_restart["web"] = 0
                             last_hb["web"] = 0
 
+                        elif proc_name == "email" and _safe_is_alive(email_process):
+                            was_running = True
+                            email_process.terminate()
+                            email_process.join(2)
+                            email_process = None
+                            last_restart["email"] = 0
+                            last_hb["email"] = 0
+
                         log_supervisor_state(db_queue, proc_name.upper(), "RESTART_REQUESTED")
 
                         try:
@@ -531,6 +585,37 @@ if __name__ == "__main__":
             if shutdown_event.is_set():
                 break
 
+            try:
+                storm_count = int(5)
+            except Exception:
+                storm_count = 5
+            try:
+                storm_window = int(300)
+            except Exception:
+                storm_window = 300
+
+            for proc_name in restart_history:
+                history = [ts for ts in restart_history.get(proc_name, []) if (now - ts) <= storm_window]
+                restart_history[proc_name] = history
+
+                if len(history) >= storm_count:
+                    if not restart_storm_alerted.get(proc_name, False):
+                        _send_supervisor_email_alert(
+                            email_queue,
+                            "restart_storm_" + proc_name,
+                            "RESTART_STORM",
+                            "Process is restarting repeatedly.",
+                            severity="critical",
+                            extra={
+                                "process": proc_name,
+                                "restart_count": len(history),
+                                "window_seconds": storm_window
+                            }
+                        )
+                        restart_storm_alerted[proc_name] = True
+                else:
+                    restart_storm_alerted[proc_name] = False
+
             # ---- DB FIRST ----
             if not _safe_is_alive(db_process):
                 db_ready = False
@@ -540,7 +625,7 @@ if __name__ == "__main__":
                     last_restart["db"] = now
                     log_supervisor_state(db_queue, "DB", "RESTARTED_DB_DIED")
 
-                    for p in (engine_process, sensor_process, relay_process, ui_process, web_process):
+                    for p in (engine_process, sensor_process, relay_process, ui_process, web_process, email_process):
                         if _safe_is_alive(p):
                             try:
                                 p.terminate()
@@ -553,13 +638,14 @@ if __name__ == "__main__":
                     relay_process = None
                     ui_process = None
                     web_process = None
+                    email_process = None
 
                     db_process = start_db(
                         DB_PATH, MODE, db_queue, engine_ctrl_queue, sensor_ctrl_queue,
-                        relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue,
-                        supervisor_queue, shutdown_event
+                        relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue,
+                        email_queue, supervisor_queue, shutdown_event
                     )
-                    _mark_started("db", last_started, restart_counts)
+                    _mark_started("db", last_started, restart_counts, restart_history)
 
                     db_ready = wait_for_db_ready(supervisor_queue, shutdown_event, timeout=5.0)
 
@@ -571,6 +657,7 @@ if __name__ == "__main__":
                         last_hb["relay"] = 0
                         last_hb["ui"] = 0
                         last_hb["web"] = 0
+                        last_hb["email"] = 0
 
             # ---- Watchdog timeouts with start grace ----
             if _safe_is_alive(engine_process):
@@ -638,7 +725,20 @@ if __name__ == "__main__":
                     web_process = None
                     web_restarted_this_tick = True
 
-            # ---- Restart Engine/Sensor/Relay/UI/Web only if DB alive and ready ----
+            if _safe_is_alive(email_process):
+                hb_age = _heartbeat_age("email", last_hb, now)
+                if hb_age is not None and (not _in_start_grace("email", last_started, now)) and hb_age > HEARTBEAT_TIMEOUT_EMAIL:
+                    print("[Supervisor] Email heartbeat timeout - restarting email")
+                    log_supervisor_state(db_queue, "EMAIL", "RESTARTED_HEARTBEAT_TIMEOUT")
+                    try:
+                        email_process.terminate()
+                        email_process.join(2)
+                    except Exception:
+                        pass
+                    email_process = None
+                    email_restarted_this_tick = True
+
+            # ---- Restart Engine/Sensor/Relay/UI/Web/Email only if DB alive and ready ----
             if _safe_is_alive(db_process) and db_ready:
                 if (engine_process is None or (not engine_process.is_alive())) and (not engine_restarted_this_tick):
                     if now - last_restart["engine"] >= MIN_RESTART_GAP:
@@ -647,9 +747,9 @@ if __name__ == "__main__":
                         last_restart["engine"] = now
                         engine_process = start_engine(
                             engine_queue, engine_rpc_queue, ui_queue, web_queue,
-                            db_queue, engine_ctrl_queue, relay_queue, MODE, DB_PATH, shutdown_event
+                            db_queue, engine_ctrl_queue, relay_queue, email_queue, MODE, DB_PATH, shutdown_event
                         )
-                        _mark_started("engine", last_started, restart_counts)
+                        _mark_started("engine", last_started, restart_counts, restart_history)
                         last_hb["engine"] = 0
 
                 if (sensor_process is None or (not sensor_process.is_alive())) and (not sensor_restarted_this_tick):
@@ -658,9 +758,9 @@ if __name__ == "__main__":
                         log_supervisor_state(db_queue, "SENSOR", "RESTARTED_NOT_RUNNING")
                         last_restart["sensor"] = now
                         sensor_process = start_sensor(
-                            engine_queue, db_queue, sensor_ctrl_queue, ui_queue, web_queue, MODE, shutdown_event
+                            engine_queue, db_queue, sensor_ctrl_queue, ui_queue, web_queue, email_queue, MODE, shutdown_event
                         )
-                        _mark_started("sensor", last_started, restart_counts)
+                        _mark_started("sensor", last_started, restart_counts, restart_history)
                         last_hb["sensor"] = 0
 
                 if (relay_process is None or (not relay_process.is_alive())) and (not relay_restarted_this_tick):
@@ -670,9 +770,9 @@ if __name__ == "__main__":
                         last_restart["relay"] = now
                         relay_process = start_relay(
                             relay_queue, db_queue, relay_ctrl_queue, ui_queue, web_queue,
-                            rpc_reply_queue, engine_rpc_queue, web_rpc_queue, MODE, shutdown_event
+                            rpc_reply_queue, engine_rpc_queue, web_rpc_queue, email_queue, MODE, shutdown_event
                         )
-                        _mark_started("relay", last_started, restart_counts)
+                        _mark_started("relay", last_started, restart_counts, restart_history)
                         last_hb["relay"] = 0
 
                 if (ui_process is None or (not ui_process.is_alive())) and (not ui_restarted_this_tick):
@@ -683,7 +783,7 @@ if __name__ == "__main__":
                         ui_process = start_ui(
                             ui_queue, ui_ctrl_queue, db_queue, supervisor_request_queue, MODE, shutdown_event
                         )
-                        _mark_started("ui", last_started, restart_counts)
+                        _mark_started("ui", last_started, restart_counts, restart_history)
                         last_hb["ui"] = 0
 
                 if (web_process is None or (not web_process.is_alive())) and (not web_restarted_this_tick):
@@ -693,10 +793,21 @@ if __name__ == "__main__":
                         last_restart["web"] = now
                         web_process = start_web(
                             web_queue, web_ctrl_queue, db_queue, relay_queue, web_rpc_queue,
-                            supervisor_request_queue, MODE, DB_PATH, shutdown_event
+                            supervisor_request_queue, email_queue, MODE, DB_PATH, shutdown_event
                         )
-                        _mark_started("web", last_started, restart_counts)
+                        _mark_started("web", last_started, restart_counts, restart_history)
                         last_hb["web"] = 0
+
+                if (email_process is None or (not email_process.is_alive())) and (not email_restarted_this_tick):
+                    if now - last_restart["email"] >= MIN_RESTART_GAP:
+                        print("[Supervisor] Email not running - starting")
+                        log_supervisor_state(db_queue, "EMAIL", "RESTARTED_NOT_RUNNING")
+                        last_restart["email"] = now
+                        email_process = start_email(
+                            email_queue, db_queue, email_ctrl_queue, MODE, shutdown_event
+                        )
+                        _mark_started("email", last_started, restart_counts, restart_history)
+                        last_hb["email"] = 0
 
             if shutdown_event.is_set():
                 break
@@ -728,6 +839,7 @@ if __name__ == "__main__":
         "Sensor": sensor_process,
         "Engine": engine_process,
         "Relay": relay_process,
+        "Email": email_process,
         "DB": db_process
     }
 

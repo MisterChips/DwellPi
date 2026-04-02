@@ -14,13 +14,9 @@ var SETTING_KEY_MAP = {
     "ip-chsettings-default-on-setpoint": "DEFAULT_ON_SETPOINT",
     "ip-chsettings-default-setpoint": "DEFAULT_SETPOINT",
     "ip-temp-sensor-adjustment-degrees": "TEMP_SENSOR_ADJUSTMENT_DEGREES",
-    "ip-chsettings-heatup-rate": "HEATUP_RATE",
     "ip-chsettings-hysteresis-band": "HYSTERESIS_BAND",
     "ip-chsettings-min-on-seconds": "CH_MIN_ON_SECONDS",
-    "ip-chsettings-min-off-seconds": "CH_MIN_OFF_SECONDS",
-    "ip-chsettings-min-startup-time": "MINIMUM_HEATING_STARTUP_TIME",
-    "ip-chsettings-max-startup-time": "MAXIMUM_HEATING_STARTUP_TIME",
-    "ip-chsettings-target-setpoint-offset": "TARGET_SETPOINT_OFFSET"
+    "ip-chsettings-min-off-seconds": "CH_MIN_OFF_SECONDS"
 };
 
 function setRadio(name, wantedValue) {
@@ -126,13 +122,9 @@ async function loadCHSettingsStatus() {
             setEditableValue("ip-chsettings-default-on-setpoint", cfg.DEFAULT_ON_SETPOINT);
             setEditableValue("ip-chsettings-default-setpoint", cfg.DEFAULT_SETPOINT);
             setEditableValue("ip-temp-sensor-adjustment-degrees", cfg.TEMP_SENSOR_ADJUSTMENT_DEGREES);
-            setEditableValue("ip-chsettings-heatup-rate", cfg.HEATUP_RATE);
             setEditableValue("ip-chsettings-hysteresis-band", cfg.HYSTERESIS_BAND);
             setEditableValue("ip-chsettings-min-on-seconds", cfg.CH_MIN_ON_SECONDS);
             setEditableValue("ip-chsettings-min-off-seconds", cfg.CH_MIN_OFF_SECONDS);
-            setEditableValue("ip-chsettings-min-startup-time", cfg.MINIMUM_HEATING_STARTUP_TIME);
-            setEditableValue("ip-chsettings-max-startup-time", cfg.MAXIMUM_HEATING_STARTUP_TIME);
-            setEditableValue("ip-chsettings-target-setpoint-offset", cfg.TARGET_SETPOINT_OFFSET);
         }
 
         // Comfort Radios Shield

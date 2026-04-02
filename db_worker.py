@@ -62,8 +62,6 @@ class DBWorker(object):
         # ---- log buffers ----
         self.temp_buf = []       # list of tuples for temperature_log
         self.state_buf = []      # list of tuples for state_log
-        #HEARTBEAT to DB
-        #self.heartbeat_buf = []  # list of tuples for heartbeat_log
         self.last_log_flush = 0.0
 
     def connect(self):
@@ -73,14 +71,9 @@ class DBWorker(object):
         self.conn.execute("PRAGMA foreign_keys=ON")
 
         # Ensure core runtime tables exist.
-        # Full schema is expected to be created by db_init before this worker starts.
         self.conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS temperature_log (ts_epoch REAL, ts TEXT, source TEXT, value REAL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS state_log (ts_epoch REAL, ts TEXT, system TEXT, state TEXT)")
-
-        # HEARTBEAT to DB
-        # optional heartbeat log table
-        #self.conn.execute("CREATE TABLE IF NOT EXISTS heartbeat_log (ts_epoch REAL, ts TEXT, source TEXT)")
         self.conn.commit()
 
     def load_settings_cache(self):
@@ -91,7 +84,6 @@ class DBWorker(object):
         for k, v in rows:
             self.settings[k] = v
 
-        # make sure LOGGING_INTERVAL exists in cache (fallback)
         if "LOGGING_INTERVAL" not in self.settings:
             self.settings["LOGGING_INTERVAL"] = "600"
 
@@ -219,7 +211,6 @@ class DBWorker(object):
             "warmup": warmup,
         }
 
-
     def _get_log_items_for_day(self, table_name, columns, date_text):
         start_epoch, end_epoch, day_used = self._get_day_range_epoch(date_text)
 
@@ -286,18 +277,15 @@ class DBWorker(object):
 
     def prune_old_data(self, days_to_keep=30):
         now = time.time()
-        # 86400 seconds in a day
         cutoff_epoch = now - (days_to_keep * 86400)
 
         cur = self.conn.cursor()
         try:
             self._begin()
 
-            # Delete old temperatures
             cur.execute("DELETE FROM temperature_log WHERE ts_epoch < ?", (cutoff_epoch,))
             temp_deleted = cur.rowcount
 
-            # Delete old state changes
             cur.execute("DELETE FROM state_log WHERE ts_epoch < ?", (cutoff_epoch,))
             state_deleted = cur.rowcount
 
@@ -306,10 +294,6 @@ class DBWorker(object):
             if temp_deleted > 0 or state_deleted > 0:
                 print("[DB] Pruning Complete: Removed %d temp rows and %d state rows." %
                       (temp_deleted, state_deleted))
-
-                # Optional: If you deleted a HUGE amount of data (e.g. first prune)
-                # you can run VACUUM, but it's slow. Usually not needed daily.
-                # self.conn.execute("VACUUM")
 
         except Exception:
             self._rollback_quiet()
@@ -330,15 +314,11 @@ class DBWorker(object):
         start_epoch = time.mktime(start_dt.timetuple())
         end_epoch = time.mktime(end_dt.timetuple())
 
-        # if today, only return up to "now"
         if start_dt.date() == now.date():
             end_epoch = time.time()
 
         return start_epoch, end_epoch, start_dt.strftime("%Y-%m-%d")
 
-    # -------------------------
-    # atomic settings flush
-    # -------------------------
     def flush_settings(self):
         if not self.dirty:
             return
@@ -347,7 +327,6 @@ class DBWorker(object):
         cur = self.conn.cursor()
 
         try:
-            # atomic batch update
             self._begin()
             for key in keys:
                 val = self.settings.get(key)
@@ -360,9 +339,6 @@ class DBWorker(object):
             print("[DB] ERROR flushing settings")
             traceback.print_exc()
 
-    # -------------------------
-    # batched log flush
-    # -------------------------
     def flush_logs_if_due(self, force=False):
         interval = self.get_logging_interval_seconds()
         now = time.time()
@@ -388,48 +364,30 @@ class DBWorker(object):
                 )
                 self.state_buf = []
 
-            # HEARTBEAT to DB
-            #if self.heartbeat_buf:
-            #    cur.executemany(
-            #        "INSERT INTO heartbeat_log (ts_epoch, ts, source) VALUES (?, ?, ?)",
-            #        self.heartbeat_buf
-            #    )
-            #    self.heartbeat_buf = []
-
             self._commit()
             self.last_log_flush = now
-            # print("[DB] Log flush OK")
         except Exception:
             self._rollback_quiet()
             print("[DB] ERROR flushing logs")
             traceback.print_exc()
 
-    # -------------------------
-    # setting validation
-    # -------------------------
     def _validate_or_default(self, key, value):
         if key not in SETTINGS_SCHEMA:
-            # unknown keys allowed? choose policy:
-            # return False to reject OR True to allow.
-            # For now: allow unknown keys.
-            return True, value
+            return None, None
 
         schema = SETTINGS_SCHEMA[key]
         if validate_setting(key, value, schema):
             return True, value
 
-        # invalid -> default
         default_val = schema.get("default")
         return False, default_val
 
-    # -------------------------
-    # message handlers
-    # -------------------------
-
-    def send_settings_snapshot(self, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def send_settings_snapshot(self, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
+                               web_ctrl_queue, email_ctrl_queue):
         snap = dict(self.settings)
         msg = Message("db", "settings_snapshot", {"values": snap})
-        for q in (engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+        for q in (engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue,
+                  email_ctrl_queue):
             try:
                 q.put(msg)
             except Exception:
@@ -454,13 +412,14 @@ class DBWorker(object):
         return [self._row_to_dict(columns, row) for row in rows]
 
     def _reply_queue_for_source(self, source, engine_ctrl_queue, sensor_ctrl_queue,
-                                relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+                                relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         return {
             "engine": engine_ctrl_queue,
             "sensor": sensor_ctrl_queue,
             "relay": relay_ctrl_queue,
             "ui": ui_ctrl_queue,
             "web": web_ctrl_queue,
+            "email": email_ctrl_queue,
         }.get(source)
 
     def _make_response(self, msg, msg_type, payload):
@@ -473,10 +432,10 @@ class DBWorker(object):
         )
 
     def _reply_to_source(self, msg, resp, engine_ctrl_queue, sensor_ctrl_queue,
-                         relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+                         relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         q = self._reply_queue_for_source(
             msg.source,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
         if q is None:
@@ -488,8 +447,41 @@ class DBWorker(object):
         except Exception as e:
             print("[DB] WARNING: failed reply to %r: %s" % (msg.source, e))
 
+    def handle_test_email_request(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
+                                  relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue,
+                                  email_ctrl_queue, email_queue):
+        if msg.source not in ("ui", "web"):
+            resp = self._error_response(msg, "test_email_result", "Invalid source")
+            self._reply_to_source(
+                msg, resp,
+                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
+            )
+            return
+
+        try:
+            email_queue.put(Message(
+                "db",
+                "test_email",
+                {},
+                request_id=msg.request_id
+            ))
+
+            resp = self._make_response(msg, "test_email_result", {
+                "ok": True,
+                "status": "accepted"
+            })
+        except Exception as e:
+            resp = self._error_response(msg, "test_email_result", str(e))
+
+        self._reply_to_source(
+            msg, resp,
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
+        )
+
     def handle_get_setting(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                           ui_ctrl_queue, web_ctrl_queue):
+                           ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         key = (msg.payload or {}).get("key")
         val = self.settings.get(key)
 
@@ -500,11 +492,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_programs(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                            ui_ctrl_queue, web_ctrl_queue):
+                            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
         system = str(p.get("system") or "").upper()
         schedule_set_name = str(p.get("schedule_set_name") or "NORMAL").strip().upper()
@@ -519,7 +512,8 @@ class DBWorker(object):
             })
             self._reply_to_source(
                 msg, resp,
-                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
             )
             return
 
@@ -555,11 +549,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                           ui_ctrl_queue, web_ctrl_queue):
+                           ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
         try:
             program_id = int(p.get("id"))
@@ -573,7 +568,8 @@ class DBWorker(object):
             })
             self._reply_to_source(
                 msg, resp,
-                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
             )
             return
 
@@ -611,11 +607,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_create_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                              ui_ctrl_queue, web_ctrl_queue):
+                              ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             data = self._parse_program_payload(msg.payload, require_id=False)
 
@@ -646,11 +643,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_update_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                              ui_ctrl_queue, web_ctrl_queue):
+                              ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             data = self._parse_program_payload(msg.payload, require_id=True)
 
@@ -697,11 +695,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_delete_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                              ui_ctrl_queue, web_ctrl_queue):
+                              ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -731,11 +730,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_copy_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                            ui_ctrl_queue, web_ctrl_queue):
+                            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -771,11 +771,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_active_ch_program(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
-                                     relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+                                     relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             now_epoch = float((msg.payload or {}).get("now_epoch", time.time()))
         except Exception:
@@ -852,11 +853,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_update_program_setpoint(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                       ui_ctrl_queue, web_ctrl_queue):
+                                       ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -868,7 +870,8 @@ class DBWorker(object):
             resp = self._error_response(msg, "update_program_setpoint_result", "Invalid program id")
             self._reply_to_source(
                 msg, resp,
-                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
             )
             return
 
@@ -878,7 +881,8 @@ class DBWorker(object):
             resp = self._error_response(msg, "update_program_setpoint_result", "Invalid setpoint")
             self._reply_to_source(
                 msg, resp,
-                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
             )
             return
 
@@ -921,19 +925,22 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
-    def _push_setting_changed(self, key, value, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+    def _push_setting_changed(self, key, value, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
+                              web_ctrl_queue, email_ctrl_queue):
         msg = Message("db", "setting_changed", {"key": key, "value": value})
-        for q in (engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+        for q in (engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue,
+                  email_ctrl_queue):
             try:
                 q.put(msg)
             except Exception:
                 pass
 
     def handle_set_setting(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue,
-                           web_ctrl_queue):
+                           web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
         key = p.get("key")
         value = p.get("value")
@@ -943,6 +950,11 @@ class DBWorker(object):
             return
 
         ok, final_val = self._validate_or_default(key, value)
+
+        if ok is None:
+            print("[DB] WARNING: rejected unknown setting %r" % (key,))
+            return
+
         self.settings[key] = final_val
         self.dirty.add(key)
 
@@ -950,13 +962,13 @@ class DBWorker(object):
 
         self._push_setting_changed(
             key, final_val,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
         ts_epoch = time.time()
         ts_text = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(ts_epoch))
         state_msg = "Setting %s=%s" % (key, final_val)
-        if not ok:
+        if ok is False:
             state_msg = "Invalid %s=%s -> default %s" % (key, value, final_val)
         self.state_buf.append((ts_epoch, ts_text, "SETTINGS", state_msg))
 
@@ -981,19 +993,12 @@ class DBWorker(object):
         self.state_buf.append((ts_epoch, ts_text, system, state))
 
     def handle_heartbeat(self, msg, supervisor_queue):
-        #HEARTBEAT to DB
-        #ts_epoch = getattr(msg, "timestamp", time.time())
-        #ts_text = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(ts_epoch))
-        #self.heartbeat_buf.append((ts_epoch, ts_text, msg.source))
-
-        # Forward to supervisor (watchdog)
         try:
             supervisor_queue.put(Message("db", "heartbeat_notice", {"source": msg.source}))
         except Exception:
             pass
 
     def handle_cleanup_expired_overrides(self, msg):
-        now_epoch = None
         try:
             now_epoch = float((msg.payload or {}).get("now_epoch", time.time()))
         except Exception:
@@ -1007,10 +1012,9 @@ class DBWorker(object):
             self._commit()
         except Exception:
             self._rollback_quiet()
-            # keep quiet-ish; or log if you prefer
 
     def handle_get_state_log(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                             ui_ctrl_queue, web_ctrl_queue):
+                             ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             req_date = (msg.payload or {}).get("date")
             day_used, items = self._get_log_items_for_day(
@@ -1033,11 +1037,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_temperature_log(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                   ui_ctrl_queue, web_ctrl_queue):
+                                   ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             req_date = (msg.payload or {}).get("date")
             day_used, items = self._get_log_items_for_day(
@@ -1060,7 +1065,8 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def _parse_systems_csv(self, systems):
@@ -1087,7 +1093,7 @@ class DBWorker(object):
             raise ValueError("End must be after start")
 
     def handle_get_schedule_sets(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                 ui_ctrl_queue, web_ctrl_queue):
+                                 ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             items = self._fetch_all_dicts(
                 self.SCHEDULE_SET_COLUMNS,
@@ -1111,11 +1117,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_holidays(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
-                            relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+                            relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             items = self._fetch_all_dicts(
                 self.HOLIDAY_COLUMNS,
@@ -1140,11 +1147,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                           ui_ctrl_queue, web_ctrl_queue):
+                           ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             holiday_id = int((msg.payload or {}).get("id"))
             item = self._fetch_one_dict(
@@ -1177,11 +1185,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_create_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                              ui_ctrl_queue, web_ctrl_queue):
+                              ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1219,11 +1228,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_update_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                              ui_ctrl_queue, web_ctrl_queue):
+                              ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1266,11 +1276,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_delete_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                              ui_ctrl_queue, web_ctrl_queue):
+                              ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             holiday_id = int((msg.payload or {}).get("id"))
 
@@ -1287,11 +1298,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_copy_holiday(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                            ui_ctrl_queue, web_ctrl_queue):
+                            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             holiday_id = int((msg.payload or {}).get("id"))
 
@@ -1321,11 +1333,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_special_periods(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                   ui_ctrl_queue, web_ctrl_queue):
+                                   ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             items = self._fetch_all_dicts(
                 self.SPECIAL_PERIOD_COLUMNS,
@@ -1350,11 +1363,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_get_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                  ui_ctrl_queue, web_ctrl_queue):
+                                  ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             item_id = int((msg.payload or {}).get("id"))
             item = self._fetch_one_dict(
@@ -1387,11 +1401,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_create_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                     ui_ctrl_queue, web_ctrl_queue):
+                                     ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1437,11 +1452,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_update_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                     ui_ctrl_queue, web_ctrl_queue):
+                                     ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         p = msg.payload or {}
 
         try:
@@ -1492,11 +1508,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_delete_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                     ui_ctrl_queue, web_ctrl_queue):
+                                     ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             item_id = int((msg.payload or {}).get("id"))
 
@@ -1513,11 +1530,12 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_copy_special_period(self, msg, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                                   ui_ctrl_queue, web_ctrl_queue):
+                                   ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         try:
             item_id = int((msg.payload or {}).get("id"))
 
@@ -1548,23 +1566,25 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_request_settings_snapshot(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
-                                         relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue):
+                                         relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue):
         resp = self._make_response(msg, "settings_snapshot", {
             "values": dict(self.settings)
         })
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def handle_request_system_action(self, msg, engine_ctrl_queue, sensor_ctrl_queue,
                                      relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue,
-                                     supervisor_queue):
+                                     email_ctrl_queue, supervisor_queue):
         p = msg.payload or {}
         action = str(p.get("action") or "").strip().lower()
 
@@ -1572,7 +1592,8 @@ class DBWorker(object):
             resp = self._error_response(msg, "system_action_result", "Invalid source")
             self._reply_to_source(
                 msg, resp,
-                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
             )
             return
 
@@ -1580,7 +1601,8 @@ class DBWorker(object):
             resp = self._error_response(msg, "system_action_result", "Invalid action")
             self._reply_to_source(
                 msg, resp,
-                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+                engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
             )
             return
 
@@ -1605,20 +1627,22 @@ class DBWorker(object):
 
         self._reply_to_source(
             msg, resp,
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
     def run(self, queue, engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-            ui_ctrl_queue, web_ctrl_queue, supervisor_queue, shutdown_event):
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue, email_queue,
+            supervisor_queue, shutdown_event):
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
         self.connect()
         self.load_settings_cache()
 
-        # Push snapshot FIRST so engine/sensor/relay/ui/web can start without RPC
         self.send_settings_snapshot(
-            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue, ui_ctrl_queue, web_ctrl_queue
+            engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+            ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
         )
 
         try:
@@ -1657,18 +1681,17 @@ class DBWorker(object):
             "delete_special_period": self.handle_delete_special_period,
             "copy_special_period": self.handle_copy_special_period,
             "request_system_action": self.handle_request_system_action,
+            "test_email_request": self.handle_test_email_request,
         }
 
         while not shutdown_event.is_set():
             try:
                 now = time.time()
 
-                # --- Auto-Prune Logic (Once every 24 hours) ---
                 if (now - self.last_prune_ts) > 86400:
                     self.prune_old_data(days_to_keep=30)
                     self.last_prune_ts = now
 
-                # flush logs periodically even if no messages arrive
                 self.flush_logs_if_due(force=False)
 
                 msg = queue.get(timeout=1)
@@ -1707,13 +1730,19 @@ class DBWorker(object):
                     handler(
                         msg,
                         engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                        ui_ctrl_queue, web_ctrl_queue, supervisor_queue
+                        ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue, supervisor_queue
+                    )
+                elif msg.type == "test_email_request":
+                    handler(
+                        msg,
+                        engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
+                        ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue, email_queue
                     )
                 else:
                     handler(
                         msg,
                         engine_ctrl_queue, sensor_ctrl_queue, relay_ctrl_queue,
-                        ui_ctrl_queue, web_ctrl_queue
+                        ui_ctrl_queue, web_ctrl_queue, email_ctrl_queue
                     )
 
             except QueueEmpty:
@@ -1723,7 +1752,6 @@ class DBWorker(object):
                 traceback.print_exc()
                 time.sleep(1)
 
-        # shutdown flush
         try:
             self.flush_settings()
             self.flush_logs_if_due(force=True)

@@ -1,5 +1,6 @@
 // A simple lock to prevent overlapping saves
 var isSaving = false;
+var isSavingEmail = false;
 
 function setStatus(text) {
     setText("syssettings-status-line", text);
@@ -25,19 +26,33 @@ const ALL_SYSTEM_SETTINGS = [
     { key: "LCD_BRIGHTNESS", id: "sys-lcd-brightness" },
     { key: "LCD_DIM_LEVEL", id: "sys-lcd-dim-level" },
     { key: "LCD_DIM_START_TIME", id: "sys-lcd-dim-start", default: "00:00" },
-    { key: "LCD_DIM_END_TIME", id: "sys-lcd-dim-end", default: "00:00" }
+    { key: "LCD_DIM_END_TIME", id: "sys-lcd-dim-end", default: "00:00" },
+
+    { key: "PREDICTIVE_HEATING_ENABLED", id: "sys-predictive-heating-enabled", default: "True" },
+    { key: "PREDICTIVE_BASE_RATE", id: "sys-predictive-base-rate", default: "0.7" },
+    { key: "PREDICTIVE_MIN_LEARNING_SECONDS", id: "sys-predictive-min-learning-seconds", default: "600" },
+    { key: "PREDICTIVE_MIN_RATE", id: "sys-predictive-min-rate", default: "0.15" },
+    { key: "PREDICTIVE_MAX_RATE", id: "sys-predictive-max-rate", default: "1.5" },
+
+    { key: "EMAIL_ENABLE", id: "sys-email-enable", default: "False" },
+    { key: "ALERT_COOLDOWN_SECONDS", id: "sys-alert-cooldown-seconds", default: "1800" },
+    { key: "ALERT_SEND_RECOVERY_EMAILS", id: "sys-alert-send-recovery-emails", default: "True" },
+
+    { key: "WARMUP_MINIMUM_LEAD_TIME", id: "sys-warmup-minimum-lead-time", default: "30" },
+    { key: "WARMUP_MAXIMUM_LEAD_TIME", id: "sys-warmup-maximum-lead-time", default: "120" },
+    { key: "FALLBACK_HEATUP_RATE", id: "sys-fallback-heatup-rate", default: "0.4" },
+    { key: "WARMUP_TARGET_OFFSET", id: "sys-warmup-target-offset", default: "-0.5" }
 ];
 
 async function saveSettings(onlyLcd = false) {
     if (isSaving) return;
     isSaving = true;
 
-    // Filter the master list if we only want LCD settings
     const list = onlyLcd
         ? ALL_SYSTEM_SETTINGS.filter(s => s.key.startsWith("LCD_"))
         : ALL_SYSTEM_SETTINGS;
 
-    setStatus(onlyLcd ? "Saving LCD settings..." : "Saving all settings...");
+    setStatus(onlyLcd ? "Saving LCD settings..." : "Saving settings...");
 
     try {
         const result = await postBulkSettings(buildPayload(list));
@@ -50,6 +65,161 @@ async function saveSettings(onlyLcd = false) {
         setStatus("Network error during save.");
     } finally {
         isSaving = false;
+    }
+}
+
+function isValidEmailList(value) {
+    if (!value) return true;
+
+    var parts = value.split(",");
+    for (var i = 0; i < parts.length; i++) {
+        var addr = parts[i].trim();
+        if (!addr) continue;
+
+        if (addr.indexOf("@") < 1 || addr.indexOf("@") !== addr.lastIndexOf("@")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function getEmailConfigPayload() {
+    var emailTo = getValue("email-to", "").trim();
+    var emailFrom = getValue("email-from", "").trim();
+    var smtpHost = getValue("smtp-host", "").trim();
+    var smtpPort = getValue("smtp-port", "465").trim();
+    var smtpUsername = getValue("smtp-username", "").trim();
+    var smtpPassword = getValue("smtp-password", "");
+    var smtpUseSsl = getValue("smtp-use-ssl", "True");
+
+    if (!isValidEmailList(emailTo)) {
+        setStatus("Invalid To email address list");
+        return null;
+    }
+
+    if (emailFrom && (emailFrom.indexOf("@") < 1 || emailFrom.indexOf("@") !== emailFrom.lastIndexOf("@"))) {
+        setStatus("Invalid From email address");
+        return null;
+    }
+
+    if (!smtpHost) {
+        setStatus("SMTP host is required");
+        return null;
+    }
+
+    if (!smtpPort || isNaN(Number(smtpPort))) {
+        setStatus("SMTP port must be a number");
+        return null;
+    }
+
+    var payload = {
+        EMAIL_TO: emailTo,
+        EMAIL_FROM: emailFrom,
+        SMTP_HOST: smtpHost,
+        SMTP_PORT: smtpPort,
+        SMTP_USERNAME: smtpUsername,
+        SMTP_USE_SSL: smtpUseSsl
+    };
+
+    if (smtpPassword) {
+        payload.SMTP_PASSWORD = smtpPassword;
+    }
+
+    return payload;
+}
+
+async function loadEmailConfig() {
+    try {
+        const r = await fetch("/api/email/config");
+        const data = await r.json();
+
+        if (!data.ok) {
+            setStatus("Failed to load email config");
+            return;
+        }
+
+        const item = data.item || {};
+
+        setValue("email-to", item.EMAIL_TO || "");
+        setValue("email-from", item.EMAIL_FROM || "");
+        setValue("smtp-host", item.SMTP_HOST || "");
+        setValue("smtp-port", item.SMTP_PORT || "465");
+        setValue("smtp-username", item.SMTP_USERNAME || "");
+        setValue("smtp-password", item.SMTP_PASSWORD || "");
+        setValue("smtp-use-ssl", item.SMTP_USE_SSL || "True");
+    } catch (e) {
+        console.log("loadEmailConfig failed", e);
+        setStatus("Error loading email config");
+    }
+}
+
+async function reloadEmailConfig() {
+    try {
+        const r = await fetch("/api/email/reload", { method: "POST" });
+        const data = await r.json();
+
+        if (data.ok) {
+            return true;
+        }
+
+        setStatus("Reload email config failed: " + (data.error || "unknown error"));
+        return false;
+    } catch (e) {
+        console.log("reloadEmailConfig failed", e);
+        setStatus("Network error reloading email config.");
+        return false;
+    }
+}
+
+async function saveEmailConfig() {
+    if (isSavingEmail) return;
+    isSavingEmail = true;
+
+    setStatus("Saving email config...");
+
+    try {
+        const configPayload = getEmailConfigPayload();
+        if (!configPayload) {
+            return;
+        }
+
+        const saveResp = await fetch("/api/email/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ item: configPayload })
+        });
+
+        const saveData = await saveResp.json();
+        if (!saveData.ok) {
+            setStatus("Email config save failed: " + (saveData.error || "unknown error"));
+            return;
+        }
+
+        const settingsResult = await postBulkSettings(buildPayload(
+            ALL_SYSTEM_SETTINGS.filter(s =>
+                s.key === "EMAIL_ENABLE" ||
+                s.key === "ALERT_COOLDOWN_SECONDS" ||
+                s.key === "ALERT_SEND_RECOVERY_EMAILS"
+            )
+        ));
+
+        if (!settingsResult.ok) {
+            setStatus("Email settings save failed: " + (settingsResult.error || "unknown error"));
+            return;
+        }
+
+        const reloadOk = await reloadEmailConfig();
+        if (!reloadOk) {
+            return;
+        }
+
+        await loadEmailConfig();
+        setStatus("Email config saved and reloaded.");
+    } catch (e) {
+        console.log("saveEmailConfig failed", e);
+        setStatus("Network error saving email config.");
+    } finally {
+        isSavingEmail = false;
     }
 }
 
@@ -91,8 +261,8 @@ async function loadSysSettingsStatus() {
 
             setValue(item.id, finalVal);
         });
-        updateSupervisorPanel(data.supervisor || {});
 
+        updateSupervisorPanel(data.supervisor || {});
         setStatus("System settings loaded.");
     } catch (e) {
         console.log("loadSysSettingsStatus failed", e);
@@ -207,7 +377,7 @@ function updateSupervisorPanel(wrapper) {
 
     var nowSec = Date.now() / 1000;
     var updatedAge = "--";
-    var ts = parseFloat(sup.timestamp || 0);
+    var ts = parseFloat(sup.timestamp || wrapper.updated || 0);
     if (!isNaN(ts) && ts > 0) {
         updatedAge = fmtAgeSeconds(nowSec - ts);
     }
@@ -231,6 +401,7 @@ function updateSupervisorPanel(wrapper) {
     setText("supervisor-relay", processSummary("Relay", procs.relay));
     setText("supervisor-ui", processSummary("UI", procs.ui));
     setText("supervisor-web", processSummary("Web", procs.web));
+    setText("supervisor-email", processSummary("Email", procs.email));
 
     var db = procs.db || {};
     setText(
@@ -268,14 +439,36 @@ async function restartProcess(name) {
     }
 }
 
+async function testEmail() {
+    setStatus("Requesting test email...");
+
+    try {
+        const r = await fetch("/api/system/test_email", { method: "POST" });
+        const data = await r.json();
+
+        if (data.ok) {
+            setStatus("Test email queued. Check inbox shortly.");
+        } else {
+            setStatus("Test email failed: " + (data.error || "unknown error"));
+        }
+    } catch (e) {
+        console.log("testEmail failed", e);
+        setStatus("Network error requesting test email.");
+    }
+}
+
 window.addEventListener("DOMContentLoaded", function () {
     loadSysSettingsStatus();
     loadSystemLoadInfo();
     loadRelayInfo();
+    loadEmailConfig();
     setInterval(loadSupervisorStatus, 5000);
 
     bindClick("bt-syssettings-save", () => saveSettings(false));
     bindClick("bt-save-lcd-settings", () => saveSettings(true));
+    bindClick("bt-save-email-settings", async () => {
+        await saveEmailConfig();
+    });
 
     // Stepper Button Setup
     document.querySelectorAll(".stepper-btn").forEach(btn => {
@@ -297,8 +490,37 @@ window.addEventListener("DOMContentLoaded", function () {
         setStatus("RelayBoard info refreshed.");
     });
 
+    bindClick("bt-reload-email-config", async () => {
+        setStatus("Reloading email config...");
+        const ok = await reloadEmailConfig();
+        if (ok) {
+            await loadEmailConfig();
+            setStatus("Email config reloaded.");
+        }
+    });
+
+    bindClick("bt-toggle-smtp-password", function () {
+        var el = document.getElementById("smtp-password");
+        var btn = document.getElementById("bt-toggle-smtp-password");
+
+        if (!el || !btn) return;
+
+        if (el.type === "password") {
+            el.type = "text";
+            btn.textContent = "Hide";
+        } else {
+            el.type = "password";
+            btn.textContent = "Show";
+        }
+    });
+
+    bindClick("bt-test-email", async () => {
+        if (!window.confirm("Send a test email now?")) return;
+        await testEmail();
+    });
+
     // RESTART Buttons
-   bindClick("bt-restart-dwellpi", async () => {
+    bindClick("bt-restart-dwellpi", async () => {
         if (!window.confirm("Restart DwellPi now?")) return;
         await postSystemAction("/api/system/restart_dwellpi", "Requesting DwellPi restart...", "DwellPi restart requested.");
     });
@@ -337,5 +559,10 @@ window.addEventListener("DOMContentLoaded", function () {
     bindClick("bt-restart-web", async () => {
         if (!window.confirm("Restart Web now?")) return;
         await restartProcess("web");
+    });
+
+    bindClick("bt-restart-email", async () => {
+        if (!window.confirm("Restart Email now?")) return;
+        await restartProcess("email");
     });
 });

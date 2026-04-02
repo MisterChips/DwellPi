@@ -11,12 +11,13 @@ from temperature_reader import TemperatureReader
 from settings_client import SettingsClient
 
 class SensorProcess(SettingsClient):
-    def __init__(self, engine_queue, db_queue, ctrl_queue, ui_queue, web_queue, mode, shutdown_event):
+    def __init__(self, engine_queue, db_queue, ctrl_queue, ui_queue, web_queue, email_queue, mode, shutdown_event):
         SettingsClient.__init__(self, ctrl_queue, shutdown_event, name="Sensor")
         self.engine_queue = engine_queue
         self.db_queue = db_queue
         self.ui_queue = ui_queue
         self.web_queue = web_queue
+        self.email_queue = email_queue
         self.mode = mode
         self.sensor_interval = 2.0
         self.temp_adjust = -4.0  # default; DB push will keep this current
@@ -27,6 +28,7 @@ class SensorProcess(SettingsClient):
         self.sensor_failed = False
         self.sensor_fail_count = 0
         self.sensor_backoff_until = 0.0
+        self._sensor_alert_active = False
 
         # DB temperature log throttling
         self.last_logged_temp = None
@@ -57,6 +59,7 @@ class SensorProcess(SettingsClient):
                 self.sensor_failed = False
                 self.sensor_fail_count = 0
                 self.sensor_backoff_until = 0.0
+                self._sensor_alert_active = False
                 print("[Sensor] SENSOR_DEVICE_ID updated: %s" % self.sensor_device_id)
 
     def _should_log_temperature(self, temp_c, now_epoch):
@@ -73,6 +76,22 @@ class SensorProcess(SettingsClient):
             return True
 
         return False
+
+    def _send_email_alert(self, alert_key, event, body, severity="error", is_recovery=False, extra=None):
+        if self.email_queue is None:
+            return
+        try:
+            self.email_queue.put(Message("sensor", "email_alert", {
+                "alert_key": alert_key,
+                "subsystem": "SENSOR",
+                "event": event,
+                "severity": severity,
+                "is_recovery": is_recovery,
+                "body": body,
+                "extra": extra or {}
+            }))
+        except Exception:
+            pass
 
     def run(self):
         import signal
@@ -127,6 +146,7 @@ class SensorProcess(SettingsClient):
 
                     if not self.sensor_failed:
                         self.sensor_failed = True
+                        self._sensor_alert_active = True
                         try:
                             self.db_queue.put(Message("sensor", "state_change", {
                                 "system": "SENSOR",
@@ -134,6 +154,12 @@ class SensorProcess(SettingsClient):
                             }))
                         except Exception:
                             pass
+                        self._send_email_alert(
+                            "sensor_failure",
+                            "SENSOR_FAIL",
+                            "Temperature sensor failed to initialise.",
+                            extra={"error": str(e), "sensor_device_id": self.sensor_device_id}
+                        )
 
                     if self.sensor_fail_count >= 5:
                         self.sensor_backoff_until = time.time() + 30.0
@@ -157,6 +183,16 @@ class SensorProcess(SettingsClient):
                         "system": "SENSOR",
                         "state": "SENSOR_OK"
                     }))
+                    if self._sensor_alert_active:
+                        self._send_email_alert(
+                            "sensor_failure",
+                            "SENSOR_OK",
+                            "Temperature sensor recovered.",
+                            severity="info",
+                            is_recovery=True,
+                            extra={"sensor_device_id": self.sensor_device_id, "temperature": adj_c}
+                        )
+                        self._sensor_alert_active = False
                 else:
                     self.sensor_fail_count = 0
                     self.sensor_backoff_until = 0.0
@@ -190,7 +226,6 @@ class SensorProcess(SettingsClient):
                 except Exception:
                     pass
 
-
             except Exception as e:
                 print("[Sensor] Temp read FAILED: %s" % e)
                 self.reader = None
@@ -198,6 +233,7 @@ class SensorProcess(SettingsClient):
 
                 if not self.sensor_failed:
                     self.sensor_failed = True
+                    self._sensor_alert_active = True
                     try:
                         self.db_queue.put(Message("sensor", "state_change", {
                             "system": "SENSOR",
@@ -205,6 +241,12 @@ class SensorProcess(SettingsClient):
                         }))
                     except Exception:
                         pass
+                    self._send_email_alert(
+                        "sensor_failure",
+                        "SENSOR_FAIL",
+                        "Temperature sensor read failed.",
+                        extra={"error": str(e), "sensor_device_id": self.sensor_device_id}
+                    )
 
                 if self.sensor_fail_count >= 5:
                     self.sensor_backoff_until = time.time() + 30.0

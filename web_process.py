@@ -70,13 +70,14 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 class WebProcess(SettingsSyncMixin, object):
     def __init__(self, web_queue, ctrl_queue, db_queue, relay_queue, web_rpc_queue,
-                 supervisor_queue, mode, db_path, shutdown_event):
+                 supervisor_queue, email_queue, mode, db_path, shutdown_event):
         self.web_queue = web_queue
         self.ctrl_queue = ctrl_queue
         self.db_queue = db_queue
         self.relay_queue = relay_queue
         self.web_rpc_queue = web_rpc_queue
         self.supervisor_queue = supervisor_queue
+        self.email_queue = email_queue
         self.mode = mode
         self.db_path = db_path
         self.shutdown_event = shutdown_event
@@ -105,6 +106,8 @@ class WebProcess(SettingsSyncMixin, object):
         self.supervisor_status = {}
         self.supervisor_status_lock = threading.Lock()
         self.supervisor_status_updated = 0.0
+
+        self.email_config_path = "/home/pi/dwellpi_email.conf"
 
     def _rpc_db(self, msg_type, payload, timeout=2.0):
         import uuid
@@ -220,6 +223,61 @@ class WebProcess(SettingsSyncMixin, object):
             time.sleep(0.01)
 
         return None
+
+    def _read_email_config_file(self):
+        data = {
+            "EMAIL_TO": "",
+            "EMAIL_FROM": "",
+            "SMTP_HOST": "",
+            "SMTP_PORT": "465",
+            "SMTP_USERNAME": "",
+            "SMTP_PASSWORD": "",
+            "SMTP_USE_SSL": "True",
+        }
+
+        if not os.path.exists(self.email_config_path):
+            return data
+
+        try:
+            with open(self.email_config_path, "r") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+
+                    key, value = line.split("=", 1)
+                    key = key.strip().upper()
+                    value = value.strip()
+
+                    if key in data:
+                        data[key] = value
+        except Exception:
+            pass
+
+        return data
+
+    def _write_email_config_file(self, data):
+        lines = [
+            "# DwellPi email configuration",
+            "EMAIL_TO=%s" % str(data.get("EMAIL_TO", "") or "").strip(),
+            "EMAIL_FROM=%s" % str(data.get("EMAIL_FROM", "") or "").strip(),
+            "SMTP_HOST=%s" % str(data.get("SMTP_HOST", "") or "").strip(),
+            "SMTP_PORT=%s" % str(data.get("SMTP_PORT", "465") or "").strip(),
+            "SMTP_USERNAME=%s" % str(data.get("SMTP_USERNAME", "") or "").strip(),
+            "SMTP_PASSWORD=%s" % str(data.get("SMTP_PASSWORD", "") or ""),
+            "SMTP_USE_SSL=%s" % str(data.get("SMTP_USE_SSL", "True") or "True").strip(),
+            "",
+        ]
+
+        with open(self.email_config_path, "w") as f:
+            f.write("\n".join(lines))
+
+    def _reload_email_config(self):
+        try:
+            self.email_queue.put(Message("web", "reload_email_config", {}))
+            return True
+        except Exception:
+            return False
 
     def _drain_ctrl_queue(self):
         while True:
@@ -364,15 +422,19 @@ class WebProcess(SettingsSyncMixin, object):
             "CH_SYSTEM_SWITCH", "HW_SYSTEM_SWITCH", "CH_ADVANCE", "HW_ADVANCE",
             "CH_BOOST_FINISH_TIME", "HW_BOOST_FINISH_TIME",
             "CH_BOOST_FINISH_EPOCH", "HW_BOOST_FINISH_EPOCH",
-            "DEFAULT_ON_SETPOINT", "DEFAULT_SETPOINT", "HEATUP_RATE",
-            "MINIMUM_HEATING_STARTUP_TIME", "MAXIMUM_HEATING_STARTUP_TIME",
-            "TARGET_SETPOINT_OFFSET", "COMFORT", "SENSOR_INTERVAL",
+            "DEFAULT_ON_SETPOINT", "DEFAULT_SETPOINT", "FALLBACK_HEATUP_RATE",
+            "WARMUP_MINIMUM_LEAD_TIME", "WARMUP_MAXIMUM_LEAD_TIME",
+            "WARMUP_TARGET_OFFSET", "COMFORT", "SENSOR_INTERVAL",
             "ENGINE_INTERVAL", "LOGGING_INTERVAL", "RELAY_ENABLE",
             "RELAY_BOARD_DEVICE_ID", "CH_RELAY_LETTER", "HW_RELAY_LETTER",
             "SENSOR_DEVICE_ID", "BOOST_SETPOINT", "HYSTERESIS_BAND",
             "CH_MIN_ON_SECONDS", "CH_MIN_OFF_SECONDS",
             "TEMP_SENSOR_ADJUSTMENT_DEGREES", "LCD_BRIGHTNESS",
-            "LCD_DIM_LEVEL", "LCD_DIM_START_TIME", "LCD_DIM_END_TIME"
+            "LCD_DIM_LEVEL", "LCD_DIM_START_TIME", "LCD_DIM_END_TIME",
+            "EMAIL_ENABLE", "ALERT_COOLDOWN_SECONDS", "ALERT_SEND_RECOVERY_EMAILS",
+
+            "PREDICTIVE_HEATING_ENABLED", "PREDICTIVE_BASE_RATE", "PREDICTIVE_MIN_LEARNING_SECONDS",
+            "PREDICTIVE_MIN_RATE", "PREDICTIVE_MAX_RATE",
         ]
 
         with self.settings_lock:
@@ -526,6 +588,13 @@ class WebProcess(SettingsSyncMixin, object):
                         "state": outer._get_state_snapshot(),
                         "settings": outer._get_settings_snapshot(),
                         "supervisor": outer._get_supervisor_status_snapshot()
+                    })
+                    return
+
+                if path == "/api/email/config":
+                    self._send_json(200, {
+                        "ok": True,
+                        "item": outer._read_email_config_file()
                     })
                     return
 
@@ -712,6 +781,53 @@ class WebProcess(SettingsSyncMixin, object):
                             changed.append(str(key))
 
                         self._send_json(200, {"ok": True, "changed": changed})
+                        return
+
+                    if parsed.path == "/api/email/config":
+                        body = self._read_body_or_400(raw_body)
+                        if body is None:
+                            return
+
+                        item = body.get("item") or body
+
+                        current_cfg = outer._read_email_config_file()
+
+                        new_cfg = {
+                            "EMAIL_TO": str(item.get("EMAIL_TO", current_cfg.get("EMAIL_TO", "")) or "").strip(),
+                            "EMAIL_FROM": str(item.get("EMAIL_FROM", current_cfg.get("EMAIL_FROM", "")) or "").strip(),
+                            "SMTP_HOST": str(item.get("SMTP_HOST", current_cfg.get("SMTP_HOST", "")) or "").strip(),
+                            "SMTP_PORT": str(item.get("SMTP_PORT", current_cfg.get("SMTP_PORT", "465")) or "").strip(),
+                            "SMTP_USERNAME": str(
+                                item.get("SMTP_USERNAME", current_cfg.get("SMTP_USERNAME", "")) or "").strip(),
+                            "SMTP_PASSWORD": str(item.get("SMTP_PASSWORD", current_cfg.get("SMTP_PASSWORD", "")) or ""),
+                            "SMTP_USE_SSL": str(
+                                item.get("SMTP_USE_SSL", current_cfg.get("SMTP_USE_SSL", "True")) or "True").strip(),
+                        }
+
+                        outer._write_email_config_file(new_cfg)
+
+                        reloaded = outer._reload_email_config()
+
+                        self._send_json(200, {
+                            "ok": True,
+                            "reloaded": bool(reloaded)
+                        })
+                        return
+
+                    if parsed.path == "/api/email/reload":
+                        if outer._reload_email_config():
+                            self._send_json(200, {"ok": True})
+                        else:
+                            self._send_json(500, {"ok": False, "error": "Failed to queue email config reload"})
+                        return
+
+                    if parsed.path == "/api/system/test_email":
+                        msg = outer._rpc_db("test_email_request", {}, timeout=5.0)
+
+                        if msg is None:
+                            self._send_json(504, {"ok": False, "error": "DB timeout"})
+                        else:
+                            self._send_json(200, msg.payload or {"ok": False, "error": "Empty DB reply"})
                         return
 
                     if parsed.path == "/api/system/restart_dwellpi":

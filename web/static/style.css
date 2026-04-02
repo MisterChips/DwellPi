@@ -457,6 +457,34 @@ button:hover,
     box-sizing: border-box;
 }
 
+.form-row select.detail-big-input {
+    min-height: 52px;
+    font-size: 1.15rem;
+}
+
+/* Larger inputs for detail pages */
+.detail-big-input {
+    width: 100%;
+    min-height: 52px;
+    padding: 10px 12px;
+    font-size: 1.15rem;
+}
+
+.detail-note-input {
+    width: 100%;
+    min-height: 52px;
+    padding: 10px 12px;
+    font-size: 1.15rem;
+}
+
+@media (max-width: 380px) {
+    .detail-big-input,
+    .detail-note-input {
+        min-height: 48px;
+        font-size: 1.05rem;
+    }
+}
+
 /* Day selection */
 .days-grid {
     display: grid;

@@ -14,13 +14,14 @@ from settings_client import SettingsClient
 
 class EngineProcess(SettingsClient):
     def __init__(self, engine_queue, engine_rpc_queue, ui_queue, web_queue,
-                 db_queue, ctrl_queue, relay_queue, mode, db_path, shutdown_event):
+                 db_queue, ctrl_queue, relay_queue, email_queue, mode, db_path, shutdown_event):
         SettingsClient.__init__(self, ctrl_queue, shutdown_event, name="Engine")
 
         self.engine_queue = engine_queue
         self.engine_rpc_queue = engine_rpc_queue
         self.ui_queue = ui_queue
         self.web_queue = web_queue
+        self.email_queue = email_queue
         self.db_queue = db_queue
         self.ctrl_queue = ctrl_queue
         self.mode = mode
@@ -35,6 +36,11 @@ class EngineProcess(SettingsClient):
         self.relay_enable = False
         self.ch_relay_letter = "A"
         self.hw_relay_letter = "B"
+
+        # actual relay states reported by relay process / board
+        self.ch_actual_relay = None   # "ON"/"OFF"/None
+        self.hw_actual_relay = None   # "ON"/"OFF"/None
+        self.last_actual_relay_update_epoch = 0.0
 
         # defaults (will be overwritten by snapshot/push)
         self.engine_interval = 2.0
@@ -52,6 +58,12 @@ class EngineProcess(SettingsClient):
         self.default_on_setpoint = 20.0
         self.hysteresis_band = 0.0
 
+        # warmup / legacy heat-up settings
+        self.fallback_heatup_rate = 0.4
+        self.warmup_minimum_lead_time = 30   # minutes
+        self.warmup_maximum_lead_time = 120  # minutes
+        self.warmup_target_offset = 0.0
+
         # relay reply checking
         self._last_relay_sync = 0.0
         self._pending_sync_request_id = None
@@ -66,6 +78,31 @@ class EngineProcess(SettingsClient):
         # CH/HW decision state
         self.ch_desired = None  # "ON"/"OFF"
         self.hw_desired = None  # "ON"/"OFF"
+
+        # alert thresholds / state
+        self.alert_relay_timeout_seconds = 10.0
+        self.alert_temp_rise_check_seconds = 900.0
+        self.alert_temp_rise_min_delta = 0.3
+
+        self._relay_mismatch_active = False
+        self._pending_relay_verification = None
+
+        self._temp_rise_active = False
+        self._temp_rise_start_epoch = None
+        self._temp_rise_start_temp = None
+        self._temp_rise_alert_active = False
+
+        # ---- predictive heating / adaptive heat-up model ----
+        self.predictive_heating_enabled = True
+        self.predictive_base_rate = 0.7   # °C/hour, derived from legacy data
+        self.predictive_min_rate = 0.15   # floor to avoid divide-by-zero / nonsense
+        self.predictive_max_rate = 1.50   # clamp for safety
+        self.predictive_min_learning_seconds = 600.0
+
+        self.last_heatup_temp = None
+        self.last_heatup_ts = 0.0
+        self.live_heatup_rate = None      # °C/hour
+        self.last_predicted_seconds = None
 
     def _apply_setting_changed(self, key, value):
         try:
@@ -85,6 +122,14 @@ class EngineProcess(SettingsClient):
                 self.default_on_setpoint = float(value)
             elif key == "HYSTERESIS_BAND":
                 self.hysteresis_band = float(value)
+            elif key == "FALLBACK_HEATUP_RATE":
+                self.fallback_heatup_rate = float(value)
+            elif key == "WARMUP_MINIMUM_LEAD_TIME":
+                self.warmup_minimum_lead_time = max(0, int(float(value)))
+            elif key == "WARMUP_MAXIMUM_LEAD_TIME":
+                self.warmup_maximum_lead_time = max(0, int(float(value)))
+            elif key == "WARMUP_TARGET_OFFSET":
+                self.warmup_target_offset = float(value)
             elif key == "RELAY_ENABLE":
                 self.relay_enable = parse_bool(value)
             elif key == "CH_RELAY_LETTER":
@@ -103,6 +148,36 @@ class EngineProcess(SettingsClient):
                 self.ch_min_on_seconds = max(0, int(float(value)))
             elif key == "CH_MIN_OFF_SECONDS":
                 self.ch_min_off_seconds = max(0, int(float(value)))
+            elif key == "ALERT_SENSOR_STALE_SECONDS":
+                self.temp_stale_timeout = max(10.0, float(value))
+            elif key == "ALERT_RELAY_TIMEOUT_SECONDS":
+                self.alert_relay_timeout_seconds = max(1.0, float(value))
+            elif key == "ALERT_TEMP_RISE_CHECK_SECONDS":
+                self.alert_temp_rise_check_seconds = max(60.0, float(value))
+            elif key == "ALERT_TEMP_RISE_MIN_DELTA":
+                self.alert_temp_rise_min_delta = max(0.1, float(value))
+            elif key == "PREDICTIVE_HEATING_ENABLED":
+                self.predictive_heating_enabled = parse_bool(value)
+            elif key == "PREDICTIVE_BASE_RATE":
+                try:
+                    self.predictive_base_rate = max(0.05, float(value))
+                except Exception:
+                    pass
+            elif key == "PREDICTIVE_MIN_LEARNING_SECONDS":
+                try:
+                    self.predictive_min_learning_seconds = max(60.0, float(value))
+                except Exception:
+                    pass
+            elif key == "PREDICTIVE_MIN_RATE":
+                try:
+                    self.predictive_min_rate = max(0.01, float(value))
+                except Exception:
+                    pass
+            elif key == "PREDICTIVE_MAX_RATE":
+                try:
+                    self.predictive_max_rate = max(0.05, float(value))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -163,6 +238,10 @@ class EngineProcess(SettingsClient):
 
             if ch_actual_state is None or hw_actual_state is None:
                 return False
+
+            self.ch_actual_relay = ch_actual_state
+            self.hw_actual_relay = hw_actual_state
+            self.last_actual_relay_update_epoch = time.time()
 
             now_epoch = time.time()
 
@@ -669,7 +748,6 @@ class EngineProcess(SettingsClient):
         if b_epoch < a_epoch:
             return b_entry, b_epoch
 
-        # same start time: prefer special over NORMAL
         a_is_special = (a_entry.get("source_set") != "NORMAL")
         b_is_special = (b_entry.get("source_set") != "NORMAL")
 
@@ -716,6 +794,128 @@ class EngineProcess(SettingsClient):
         except Exception:
             pass
 
+    def _clamp(self, value, low, high):
+        if value < low:
+            return low
+        if value > high:
+            return high
+        return value
+
+    def _update_live_heatup_rate(self, ch_calling_for_heat, relay_a_on, current_temp, now_epoch):
+        """
+        Estimate live heat-up rate while CH is actually heating.
+        Stores a smoothed °C/hour value in self.live_heatup_rate.
+        """
+        try:
+            current_temp = float(current_temp)
+            now_epoch = float(now_epoch)
+        except Exception:
+            return
+
+        heating_active = bool(ch_calling_for_heat and relay_a_on)
+
+        if not heating_active:
+            self.last_heatup_temp = current_temp
+            self.last_heatup_ts = now_epoch
+            return
+
+        if self.last_heatup_temp is None or self.last_heatup_ts <= 0:
+            self.last_heatup_temp = current_temp
+            self.last_heatup_ts = now_epoch
+            return
+
+        dt = now_epoch - self.last_heatup_ts
+        if dt < float(self.predictive_min_learning_seconds):
+            return
+
+        dtemp = current_temp - self.last_heatup_temp
+        raw_rate = (dtemp / dt) * 3600.0
+        raw_rate = self._clamp(raw_rate, -0.5, 2.5)
+
+        if self.live_heatup_rate is None:
+            smoothed = raw_rate
+        else:
+            smoothed = (self.live_heatup_rate * 0.7) + (raw_rate * 0.3)
+
+        self.live_heatup_rate = smoothed
+        self.last_heatup_temp = current_temp
+        self.last_heatup_ts = now_epoch
+
+    def _get_predictive_heatup_rate(self):
+        base = float(self.predictive_base_rate or 0.7)
+
+        if self.live_heatup_rate is None:
+            return self._clamp(base, self.predictive_min_rate, self.predictive_max_rate)
+
+        blended = (self.live_heatup_rate * 0.7) + (base * 0.3)
+        return self._clamp(blended, self.predictive_min_rate, self.predictive_max_rate)
+
+    def _predict_time_to_target_seconds(self, current_temp, target_temp):
+        try:
+            current_temp = float(current_temp)
+            target_temp = float(target_temp)
+        except Exception:
+            return None
+
+        delta = target_temp - current_temp
+        if delta <= 0:
+            return 0.0
+
+        rate = self._get_predictive_heatup_rate()
+        if rate <= 0:
+            return None
+
+        seconds = (delta / rate) * 3600.0
+        return max(0.0, seconds)
+
+    def _predictive_warmup_needed(self, current_temp, target_temp):
+        seconds = self._predict_time_to_target_seconds(current_temp, target_temp)
+        if seconds is None:
+            return None
+
+        try:
+            min_s = int(float(self.warmup_minimum_lead_time)) * 60
+        except Exception:
+            min_s = 30 * 60
+
+        try:
+            max_s = int(float(self.warmup_maximum_lead_time)) * 60
+        except Exception:
+            max_s = 120 * 60
+
+        return int(self._clamp(seconds, min_s, max_s))
+
+    def _legacy_warmup_needed(self, current_temp, target_temp):
+        try:
+            current_temp = float(current_temp)
+            target_temp = float(target_temp)
+            heatup_rate = float(self.heatup_rate)
+        except Exception:
+            return None
+
+        if heatup_rate <= 0:
+            return None
+
+        delta_c = max(0.0, target_temp - current_temp)
+        seconds = (delta_c / heatup_rate) * 3600.0
+
+        try:
+            min_s = int(float(self.warmup_minimum_lead_time)) * 60
+        except Exception:
+            min_s = 30 * 60
+
+        try:
+            max_s = int(float(self.warmup_maximum_lead_time)) * 60
+        except Exception:
+            max_s = 120 * 60
+
+        return int(self._clamp(seconds, min_s, max_s))
+
+    def _fmt_predictive_minutes(self, seconds_value):
+        if seconds_value is None:
+            return "--"
+        return str(int(round(float(seconds_value) / 60.0)))
+
     def _get_ch_timed_context(self, schedule_set_name, weekday_0_mon, hhmm, now_epoch):
         special_set_name = None if schedule_set_name == "NORMAL" else schedule_set_name
 
@@ -745,11 +945,12 @@ class EngineProcess(SettingsClient):
             "warmup_entry": None,
             "warmup_target": None,
             "warmup_start_epoch": None,
+            "warmup_seconds": None,
+            "warmup_mode": None,
         }
 
         if current_entry:
             ctx["current_target"] = float(current_entry["setpoint"] or self.default_setpoint)
-
             try:
                 end_epoch = current_entry.get("window_end_epoch")
             except Exception:
@@ -774,39 +975,27 @@ class EngineProcess(SettingsClient):
                     except Exception:
                         entry_setpoint = float(self.default_setpoint)
 
-                    try:
-                        heatup_rate = float(self.settings.get("HEATUP_RATE", "0.4"))
-                    except Exception:
-                        heatup_rate = 0.4
+                    warm_target = entry_setpoint + float(self.warmup_target_offset or 0.0)
 
-                    try:
-                        min_startup = int(float(self.settings.get("MINIMUM_HEATING_STARTUP_TIME", "30")))
-                    except Exception:
-                        min_startup = 30
+                    warmup_seconds = None
+                    warmup_mode = "legacy"
 
-                    try:
-                        max_startup = int(float(self.settings.get("MAXIMUM_HEATING_STARTUP_TIME", "120")))
-                    except Exception:
-                        max_startup = 120
+                    if self.predictive_heating_enabled:
+                        warmup_seconds = self._predictive_warmup_needed(self.current_temp, warm_target)
+                        warmup_mode = "predictive"
 
-                    try:
-                        target_offset = float(self.settings.get("TARGET_SETPOINT_OFFSET", "0.0"))
-                    except Exception:
-                        target_offset = 0.0
+                    if warmup_seconds is None:
+                        warmup_seconds = self._legacy_warmup_needed(self.current_temp, warm_target)
+                        warmup_mode = "legacy"
 
-                    if heatup_rate > 0:
-                        warm_target = entry_setpoint + target_offset
-                        delta_c = max(0.0, warm_target - float(self.current_temp))
-                        mins_needed = int(round((delta_c / heatup_rate) * 60.0))
-
-                        mins_needed = max(min_startup, mins_needed)
-                        mins_needed = min(max_startup, mins_needed)
-
-                        warmup_start_epoch = best_start_epoch - (mins_needed * 60.0)
+                    if warmup_seconds is not None:
+                        warmup_start_epoch = best_start_epoch - float(warmup_seconds)
 
                         ctx["warmup_entry"] = best_next
                         ctx["warmup_target"] = entry_setpoint
                         ctx["warmup_start_epoch"] = warmup_start_epoch
+                        ctx["warmup_seconds"] = warmup_seconds
+                        ctx["warmup_mode"] = warmup_mode
 
                         if warmup_start_epoch <= now_epoch < best_start_epoch:
                             ctx["warmup_active"] = True
@@ -982,10 +1171,12 @@ class EngineProcess(SettingsClient):
                 elif ctx.get("warmup_active"):
                     warmup_entry = ctx.get("warmup_entry")
                     target = float(ctx.get("warmup_target") or self.default_setpoint)
-                    reason = "warmup(id=%s starts=%s set=%s)" % (
+                    reason = "warmup(id=%s starts=%s set=%s mode=%s eta=%sm)" % (
                         warmup_entry["id"],
                         warmup_entry["start_time"],
-                        warmup_entry.get("source_set", active_set_name)
+                        warmup_entry.get("source_set", active_set_name),
+                        ctx.get("warmup_mode") or "legacy",
+                        self._fmt_predictive_minutes(ctx.get("warmup_seconds"))
                     )
                 else:
                     target = float(self.default_setpoint)
@@ -1190,6 +1381,31 @@ class EngineProcess(SettingsClient):
             return "OFF"
         return None
 
+    def _relay_state_to_bool(self, state):
+        if state == "ON":
+            return True
+        if state == "OFF":
+            return False
+        return None
+
+    def _update_actual_relays_from_payload(self, payload):
+        if not isinstance(payload, dict):
+            return
+
+        ch_letter = self._get_relay_letter("CH")
+        hw_letter = self._get_relay_letter("HW")
+
+        ch_actual = self._relay_bool_to_state(payload.get(ch_letter))
+        hw_actual = self._relay_bool_to_state(payload.get(hw_letter))
+
+        if ch_actual is not None:
+            self.ch_actual_relay = ch_actual
+        if hw_actual is not None:
+            self.hw_actual_relay = hw_actual
+
+        if ch_actual is not None or hw_actual is not None:
+            self.last_actual_relay_update_epoch = time.time()
+
     def _request_periodic_relay_sync(self):
         import uuid
 
@@ -1223,12 +1439,25 @@ class EngineProcess(SettingsClient):
                 continue
 
             p = msg.payload or {}
+            self._update_actual_relays_from_payload(p)
 
             ch_letter = self._get_relay_letter("CH")
             hw_letter = self._get_relay_letter("HW")
 
-            ch_actual = self._relay_bool_to_state(p.get(ch_letter))
-            hw_actual = self._relay_bool_to_state(p.get(hw_letter))
+            ch_actual = self.ch_actual_relay
+            hw_actual = self.hw_actual_relay
+
+            if self._pending_relay_verification:
+                verify = self._pending_relay_verification
+                actual_state = None
+                if verify.get("relay") == ch_letter:
+                    actual_state = ch_actual
+                elif verify.get("relay") == hw_letter:
+                    actual_state = hw_actual
+
+                if actual_state == verify.get("expected"):
+                    self._pending_relay_verification = None
+                    self._relay_mismatch_active = False
 
             if ch_actual is not None and ch_actual != self.ch_desired:
                 print("[Engine] SYNC MISMATCH: CH is %s but should be %s. Fixing..." %
@@ -1266,6 +1495,8 @@ class EngineProcess(SettingsClient):
             "hw_reason": hw_reason,
             "hw_switch": self.hw_system_switch,
             "hw_desired": "ON" if hw_target_on else "OFF",
+            "relay_a": self._relay_state_to_bool(self.ch_actual_relay if self._get_relay_letter("CH") == "A" else self.hw_actual_relay),
+            "relay_b": self._relay_state_to_bool(self.ch_actual_relay if self._get_relay_letter("CH") == "B" else self.hw_actual_relay),
         }
 
         try:
@@ -1291,6 +1522,109 @@ class EngineProcess(SettingsClient):
                 print("[Engine] %s relay_set failed: %s" % (label, e))
         else:
             print("[Engine] %s relay_set blocked (RELAY_ENABLE=False or mode not allowed)" % label)
+
+    def _mark_relay_verification(self, relay_letter, desired_state, label):
+        self._pending_relay_verification = {
+            "relay": relay_letter,
+            "expected": desired_state,
+            "label": label,
+            "started": time.time()
+        }
+        self._relay_mismatch_active = False
+
+    def _check_pending_relay_verification(self, now_epoch):
+        verify = self._pending_relay_verification
+        if not verify:
+            return
+
+        age = now_epoch - float(verify.get("started") or now_epoch)
+        if age < float(self.alert_relay_timeout_seconds):
+            return
+
+        if self._pending_sync_request_id is None:
+            self._request_periodic_relay_sync()
+
+        if not self._relay_mismatch_active:
+            self._relay_mismatch_active = True
+            self._send_email_alert(
+                "relay_timeout_" + str(verify.get("label") or "relay").lower(),
+                "RELAY_TIMEOUT",
+                "%s relay did not confirm expected state in time." % verify.get("label"),
+                severity="error",
+                extra={
+                    "relay": verify.get("relay"),
+                    "expected": verify.get("expected"),
+                    "timeout_seconds": self.alert_relay_timeout_seconds,
+                    "age_seconds": age
+                }
+            )
+
+    def _start_temp_rise_watch(self, now_epoch):
+        if self.current_temp is None:
+            self._temp_rise_active = False
+            self._temp_rise_start_epoch = None
+            self._temp_rise_start_temp = None
+            self._temp_rise_alert_active = False
+            return
+
+        self._temp_rise_active = True
+        self._temp_rise_start_epoch = now_epoch
+        self._temp_rise_start_temp = self.current_temp
+        self._temp_rise_alert_active = False
+
+    def _stop_temp_rise_watch(self):
+        self._temp_rise_active = False
+        self._temp_rise_start_epoch = None
+        self._temp_rise_start_temp = None
+        self._temp_rise_alert_active = False
+
+    def _check_temp_rise_watch(self, now_epoch):
+        if not self._temp_rise_active:
+            return
+        if self.current_temp is None:
+            return
+        if self._temp_rise_start_epoch is None or self._temp_rise_start_temp is None:
+            return
+        if self._temp_rise_alert_active:
+            return
+
+        elapsed = now_epoch - self._temp_rise_start_epoch
+        if elapsed < float(self.alert_temp_rise_check_seconds):
+            return
+
+        delta = float(self.current_temp) - float(self._temp_rise_start_temp)
+        if delta < float(self.alert_temp_rise_min_delta):
+            self._temp_rise_alert_active = True
+            self._send_email_alert(
+                "temp_not_rising",
+                "TEMP_NOT_RISING",
+                "Heating has been ON but room temperature has not risen enough.",
+                severity="error",
+                extra={
+                    "start_temp": self._temp_rise_start_temp,
+                    "current_temp": self.current_temp,
+                    "delta": delta,
+                    "required_delta": self.alert_temp_rise_min_delta,
+                    "elapsed_seconds": elapsed
+                }
+            )
+
+    def _send_email_alert(self, alert_key, event, body, severity="error", is_recovery=False, extra=None):
+        if self.email_queue is None:
+            return
+
+        try:
+            self.email_queue.put(Message("engine", "email_alert", {
+                "alert_key": alert_key,
+                "subsystem": "ENGINE",
+                "event": event,
+                "severity": severity,
+                "is_recovery": is_recovery,
+                "body": body,
+                "extra": extra or {}
+            }))
+        except Exception:
+            pass
 
     def run(self):
         from datetime import datetime
@@ -1352,6 +1686,17 @@ class EngineProcess(SettingsClient):
 
                 if not self._temp_stale_active:
                     self._temp_stale_active = True
+                    self._send_email_alert(
+                        "engine_sensor_stale",
+                        "SENSOR_STALE",
+                        "Temperature updates have stopped. CH has been forced OFF for safety.",
+                        severity="error",
+                        extra={
+                            "last_temp": self.current_temp,
+                            "last_temp_update_epoch": self.last_temp_update_epoch,
+                            "stale_timeout_seconds": self.temp_stale_timeout
+                        }
+                    )
                     try:
                         self.db_queue.put(Message("engine", "state_change", {
                             "system": "CH",
@@ -1389,12 +1734,25 @@ class EngineProcess(SettingsClient):
                         pass
 
                     self._send_relay_desired(self._get_relay_letter("CH"), "OFF", "CH")
+                    self._mark_relay_verification(self._get_relay_letter("CH"), "OFF", "CH")
 
+                self._stop_temp_rise_watch()
                 time.sleep(self.engine_interval)
                 continue
             else:
                 if self._temp_stale_active:
                     self._temp_stale_active = False
+                    self._send_email_alert(
+                        "engine_sensor_stale",
+                        "SENSOR_RECOVERED",
+                        "Temperature updates have resumed. Engine is operating normally again.",
+                        severity="info",
+                        is_recovery=True,
+                        extra={
+                            "current_temp": self.current_temp,
+                            "last_temp_update_epoch": self.last_temp_update_epoch
+                        }
+                    )
                     try:
                         self.db_queue.put(Message("engine", "state_change", {
                             "system": "CH",
@@ -1487,6 +1845,12 @@ class EngineProcess(SettingsClient):
                 }))
 
                 self._send_relay_desired(self._get_relay_letter("CH"), desired, "CH")
+                self._mark_relay_verification(self._get_relay_letter("CH"), desired, "CH")
+
+                if desired == "ON":
+                    self._start_temp_rise_watch(now_epoch)
+                else:
+                    self._stop_temp_rise_watch()
 
             hw_desired = "ON" if hw_target_on else "OFF"
 
@@ -1507,10 +1871,39 @@ class EngineProcess(SettingsClient):
                 }))
 
                 self._send_relay_desired(self._get_relay_letter("HW"), hw_desired, "HW")
+                self._mark_relay_verification(self._get_relay_letter("HW"), hw_desired, "HW")
 
             now = time.time()
 
-            if now - self._last_relay_sync > 300.0:
+            # use ACTUAL relay state for predictive learning when available
+            if self.ch_actual_relay is not None:
+                actual_ch_on = (self.ch_actual_relay == "ON")
+            else:
+                actual_ch_on = (self.ch_desired == "ON")
+
+            try:
+                self._update_live_heatup_rate(
+                    ch_calling_for_heat=(self.ch_desired == "ON"),
+                    relay_a_on=actual_ch_on,
+                    current_temp=self.current_temp,
+                    now_epoch=now
+                )
+            except Exception:
+                pass
+
+            if self.ch_desired == "ON":
+                if not self._temp_rise_active:
+                    self._start_temp_rise_watch(now)
+            else:
+                self._stop_temp_rise_watch()
+
+            self._check_temp_rise_watch(now)
+            self._check_pending_relay_verification(now)
+
+            # sync actual relay state more often while heating is active,
+            # otherwise keep the lighter periodic cadence
+            relay_sync_interval = 60.0 if self.ch_desired == "ON" else 300.0
+            if now - self._last_relay_sync > relay_sync_interval:
                 self._last_relay_sync = now
                 self._request_periodic_relay_sync()
 

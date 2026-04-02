@@ -36,6 +36,97 @@
             </section>
 
             <section class="panel">
+                <div class="panel-title">Warmup / Predictive Heating</div>
+                <div class="panel-body settings-stack">
+
+                    <div class="form-row">
+                        <label for="sys-predictive-heating-enabled">Predictive Heating Enabled</label>
+                        <select id="sys-predictive-heating-enabled">
+                            <option value="True">True</option>
+                            <option value="False">False</option>
+                        </select>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-predictive-base-rate">Predictive Base Rate (°C/hour)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-base-rate" data-step="-0.05">-</button>
+                            <input type="number" id="sys-predictive-base-rate" class="big-readout stepper-input" min="0.05" max="3.0" step="0.05">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-base-rate" data-step="0.05">+</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-predictive-min-learning-seconds">Predictive Min Learning Time (seconds)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-min-learning-seconds" data-step="-60">-</button>
+                            <input type="number" id="sys-predictive-min-learning-seconds" class="big-readout stepper-input" min="60" max="7200" step="60">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-min-learning-seconds" data-step="60">+</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-predictive-min-rate">Predictive Minimum Rate (°C/hour)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-min-rate" data-step="-0.05">-</button>
+                            <input type="number" id="sys-predictive-min-rate" class="big-readout stepper-input" min="0.01" max="2.0" step="0.05">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-min-rate" data-step="0.05">+</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-predictive-max-rate">Predictive Maximum Rate (°C/hour)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-max-rate" data-step="-0.05">-</button>
+                            <input type="number" id="sys-predictive-max-rate" class="big-readout stepper-input" min="0.05" max="5.0" step="0.05">
+                            <button type="button" class="stepper-btn" data-target="sys-predictive-max-rate" data-step="0.05">+</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-warmup-minimum-lead-time">Minimum Warmup Lead Time (mins)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-warmup-minimum-lead-time" data-step="-5">-</button>
+                            <input type="number" id="sys-warmup-minimum-lead-time" class="big-readout stepper-input" min="5" max="240" step="5">
+                            <button type="button" class="stepper-btn" data-target="sys-warmup-minimum-lead-time" data-step="5">+</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-warmup-maximum-lead-time">Maximum Warmup Lead Time (mins)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-warmup-maximum-lead-time" data-step="-5">-</button>
+                            <input type="number" id="sys-warmup-maximum-lead-time" class="big-readout stepper-input" min="5" max="360" step="5">
+                            <button type="button" class="stepper-btn" data-target="sys-warmup-maximum-lead-time" data-step="5">+</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-fallback-heatup-rate">Fallback Heatup Rate (°C/hour)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-fallback-heatup-rate" data-step="-0.1">-</button>
+                            <input type="number" id="sys-fallback-heatup-rate" class="big-readout stepper-input" min="0.1" max="5.0" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="sys-fallback-heatup-rate" data-step="0.1">+</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-warmup-target-offset">Warmup Target Offset (°C)</label>
+                        <div class="stepper-row">
+                            <button type="button" class="stepper-btn" data-target="sys-warmup-target-offset" data-step="-0.1">-</button>
+                            <input type="number" id="sys-warmup-target-offset" class="big-readout stepper-input" min="-5.0" max="5.0" step="0.1">
+                            <button type="button" class="stepper-btn" data-target="sys-warmup-target-offset" data-step="0.1">+</button>
+                        </div>
+                    </div>
+
+                    <div class="minor-status">
+                        Used only for heating programs where Warmup is enabled.
+                        Predictive heating blends historical and live measured heat-up rate to start heating earlier.
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel">
                 <div class="panel-title">Runtime Intervals</div>
                 <div class="panel-body">
                     <div class="form-row">
@@ -145,6 +236,83 @@
             </section>
 
             <section class="panel">
+                <div class="panel-title">Email Settings</div>
+                <div class="panel-body settings-stack">
+                    <div class="form-row">
+                        <label for="sys-email-enable">Email Enable</label>
+                        <select id="sys-email-enable">
+                            <option value="True">True</option>
+                            <option value="False">False</option>
+                        </select>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="email-to">To Email Address(es)</label>
+                        <input type="text" id="email-to" class="big-readout" placeholder="name@example.com, other@example.com">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="email-from">From Email Address</label>
+                        <input type="text" id="email-from" class="big-readout">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="smtp-host">SMTP Host</label>
+                        <input type="text" id="smtp-host" class="big-readout">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="smtp-port">SMTP Port</label>
+                        <input type="number" id="smtp-port" class="big-readout" min="1" step="1">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="smtp-username">SMTP Username</label>
+                        <input type="text" id="smtp-username" class="big-readout">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="smtp-password">SMTP Password</label>
+                        <div class="button-row button-row-two">
+                            <input type="password" id="smtp-password" class="big-readout">
+                            <button type="button" id="bt-toggle-smtp-password">Show</button>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="smtp-use-ssl">Connection Security</label>
+                        <select id="smtp-use-ssl">
+                            <option value="True">SSL/TLS</option>
+                            <option value="False">Plain SMTP</option>
+                        </select>
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-alert-cooldown-seconds">Alert Cooldown (seconds)</label>
+                        <input type="number" id="sys-alert-cooldown-seconds" class="big-readout" min="0" step="1">
+                    </div>
+
+                    <div class="form-row">
+                        <label for="sys-alert-send-recovery-emails">Send Recovery Emails</label>
+                        <select id="sys-alert-send-recovery-emails">
+                            <option value="True">True</option>
+                            <option value="False">False</option>
+                        </select>
+                    </div>
+
+                    <div class="button-row button-row-three">
+                        <button type="button" id="bt-test-email">Send Test Email</button>
+                        <button type="button" id="bt-save-email-settings">Save Email Settings</button>
+                        <button type="button" id="bt-reload-email-config">Reload Email Config</button>
+                    </div>
+
+                    <div class="minor-status">
+                        Multiple recipients can be entered as a comma-separated list.
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel">
                 <div class="panel-title-row">
                     <span>Actions</span>
                     <button id="bt-syssettings-save" class="small-action-btn">Save</button>
@@ -191,6 +359,7 @@
                     <div class="minor-status" id="supervisor-ui">UI: --</div>
                     <div class="minor-status" id="supervisor-web">Web: --</div>
                     <div class="minor-status" id="supervisor-db">DB: --</div>
+                    <div class="minor-status" id="supervisor-email">Email: --</div>
 
                     <div class="button-row button-row-two">
                         <button type="button" id="bt-restart-engine">Restart Engine</button>
@@ -202,6 +371,9 @@
                     </div>
                     <div class="button-row button-row-two">
                         <button type="button" id="bt-restart-web">Restart Web</button>
+                        <button type="button" id="bt-restart-email">Restart Email</button>
+                    </div>
+                    <div class="button-row">
                         <button type="button" id="bt-refresh-supervisor">Refresh Supervisor</button>
                     </div>
                 </div>

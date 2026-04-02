@@ -1154,10 +1154,10 @@ def menu_activate(ui_process):
         )
         return
 
-    if action == "edit_target_setpoint_offset":
-        current = ui_process.ui.settings.values.get("TARGET_SETPOINT_OFFSET", "-0.5")
+    if action == "edit_warmup_target_offset":
+        current = ui_process.ui.settings.values.get("WARMUP_TARGET_OFFSET", "-0.5")
         ui_process.controller.start_number_editor(
-            "TARGET_SETPOINT_OFFSET",
+            "WARMUP_TARGET_OFFSET",
             "Target Offset",
             current,
             min_value=-5.0,
@@ -1167,11 +1167,11 @@ def menu_activate(ui_process):
         )
         return
 
-    if action == "edit_heatup_rate":
-        current = ui_process.ui.settings.values.get("HEATUP_RATE", "0.4")
+    if action == "edit_fallback_heatup_rate":
+        current = ui_process.ui.settings.values.get("FALLBACK_HEATUP_RATE", "0.4")
         ui_process.controller.start_number_editor(
-            "HEATUP_RATE",
-            "Heatup Rate",
+            "FALLBACK_HEATUP_RATE",
+            "Fallback Heatup Rate",
             current,
             min_value=0.1,
             max_value=5.0,
@@ -1232,10 +1232,10 @@ def menu_activate(ui_process):
         )
         return
 
-    if action == "edit_minimum_heating_startup_time":
-        current = ui_process.ui.settings.values.get("MINIMUM_HEATING_STARTUP_TIME", "30")
+    if action == "edit_warmup_minimum_lead_time":
+        current = ui_process.ui.settings.values.get("WARMUP_MINIMUM_LEAD_TIME", "30")
         ui_process.controller.start_number_editor(
-            "MINIMUM_HEATING_STARTUP_TIME",
+            "WARMUP_MINIMUM_LEAD_TIME",
             "Warmup Min",
             current,
             min_value=5,
@@ -1245,10 +1245,10 @@ def menu_activate(ui_process):
         )
         return
 
-    if action == "edit_maximum_heating_startup_time":
-        current = ui_process.ui.settings.values.get("MAXIMUM_HEATING_STARTUP_TIME", "120")
+    if action == "edit_warmup_maximum_lead_time":
+        current = ui_process.ui.settings.values.get("WARMUP_MAXIMUM_LEAD_TIME", "120")
         ui_process.controller.start_number_editor(
-            "MAXIMUM_HEATING_STARTUP_TIME",
+            "WARMUP_MAXIMUM_LEAD_TIME",
             "Warmup Max",
             current,
             min_value=5,

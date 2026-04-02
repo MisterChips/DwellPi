@@ -219,7 +219,7 @@ class RelayController(object):
 class RelayProcess(SettingsClient):
     def __init__(self, relay_queue, db_queue, ctrl_queue, ui_queue, web_queue,
                  mode, shutdown_event, rpc_reply_queue=None, engine_rpc_queue=None,
-                 web_rpc_queue=None):
+                 web_rpc_queue=None, email_queue=None):
         SettingsClient.__init__(self, ctrl_queue, shutdown_event, name="Relay")
         self.relay_queue = relay_queue
         self.db_queue = db_queue
@@ -229,6 +229,7 @@ class RelayProcess(SettingsClient):
         self.mode = mode
         self.rpc_reply_queue = rpc_reply_queue
         self.engine_rpc_queue = engine_rpc_queue
+        self.email_queue = email_queue
 
         # settings-driven
         self.relay_device_id = "RB"
@@ -282,13 +283,48 @@ class RelayProcess(SettingsClient):
                 if self._hardware_allowed():
                     try:
                         self.ctrl.start()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print("[Relay] LLAP restart after device id change failed: %s" % e)
+
+                        self._send_email_alert(
+                            "relay_llap_start_failed",
+                            "LLAP_START_FAILED",
+                            "Relay failed to restart LLAP communication after relay device id change.",
+                            severity="error",
+                            extra={
+                                "relay_device_id": self.relay_device_id,
+                                "error": str(e)
+                            }
+                        )
+
+                        try:
+                            self.db_queue.put(Message("relay", "state_change", {
+                                "system": "RELAY",
+                                "state": "LLAP_RESTART_AFTER_DEVICE_ID_CHANGE_FAILED: %s" % e
+                            }))
+                        except Exception:
+                            pass
 
             print("[Relay] RELAY_BOARD_DEVICE_ID updated: %s" % self.relay_device_id)
 
         elif key == "RELAY_ENABLE":
             self.relay_enable = parse_bool(value)
+
+    def _send_email_alert(self, alert_key, event, body, severity="error", extra=None):
+        if self.email_queue is None:
+            return
+
+        try:
+            self.email_queue.put(Message("relay", "email_alert", {
+                "alert_key": alert_key,
+                "subsystem": "RELAY",
+                "event": event,
+                "severity": severity,
+                "body": body,
+                "extra": extra or {}
+            }))
+        except Exception:
+            pass
 
     def _build_status_snapshot_after_change(self, relay_letter, status):
         relay_letter = str(relay_letter or "").upper()
@@ -337,7 +373,27 @@ class RelayProcess(SettingsClient):
         if self._hardware_allowed():
             if self.relay_device_id:
                 self.ctrl.relay_device_id = self.relay_device_id
-            self.ctrl.start()
+            try:
+                self.ctrl.start()
+            except Exception as e:
+                print("[Relay] Initial LLAP start failed: %s" % e)
+                self._send_email_alert(
+                    "relay_llap_start_failed",
+                    "LLAP_START_FAILED",
+                    "Relay failed to start LLAP communication at startup.",
+                    severity="error",
+                    extra={
+                        "relay_device_id": self.relay_device_id,
+                        "error": str(e)
+                    }
+                )
+                try:
+                    self.db_queue.put(Message("relay", "state_change", {
+                        "system": "RELAY",
+                        "state": "LLAP_START_FAILED: %s" % e
+                    }))
+                except Exception:
+                    pass
         else:
             print("[Relay] Hardware disabled; LLAP will not start yet")
 
@@ -365,6 +421,16 @@ class RelayProcess(SettingsClient):
                             self._publish_state()
                         except Exception as e:
                             print("[Relay] Failed to start LLAP: %s" % e)
+                            self._send_email_alert(
+                                "relay_llap_start_failed",
+                                "LLAP_START_FAILED",
+                                "Relay failed to start LLAP communication.",
+                                severity="error",
+                                extra={
+                                    "relay_device_id": self.relay_device_id,
+                                    "error": str(e)
+                                }
+                            )
                             try:
                                 self.db_queue.put(Message("relay", "state_change", {
                                     "system": "RELAY",

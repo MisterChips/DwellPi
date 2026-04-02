@@ -48,25 +48,25 @@ SETTINGS_SCHEMA = {
         "min": 5.0,
         "max": 24.0
     },
-    "MINIMUM_HEATING_STARTUP_TIME": {
+    "WARMUP_MINIMUM_LEAD_TIME": {
         "default": "30",
         "type": "int",
         "min": 5,
         "max": 240
     },
-    "MAXIMUM_HEATING_STARTUP_TIME": {
+    "WARMUP_MAXIMUM_LEAD_TIME": {
         "default": "120",
         "type": "int",
         "min": 5,
         "max": 360
     },
-    "HEATUP_RATE": {
+    "FALLBACK_HEATUP_RATE": {
         "default": "0.4",
         "type": "float",
         "min": 0.1,
         "max": 5.0
     },
-    "TARGET_SETPOINT_OFFSET": {
+    "WARMUP_TARGET_OFFSET": {
         "default": "-0.5",
         "type": "float",
         "min": -5.0,
@@ -198,7 +198,87 @@ SETTINGS_SCHEMA = {
     "LCD_DIM_END_TIME": {
         "default": "00:00",
         "type": "time"
-    }
+    },
+
+    # Email / alerting
+    "EMAIL_ENABLE": {
+        "default": "True",
+        "type": "bool"
+    },
+    "ALERT_COOLDOWN_SECONDS": {
+        "default": "1800",
+        "type": "int",
+        "min": 0,
+        "max": 86400
+    },
+    "ALERT_SEND_RECOVERY_EMAILS": {
+        "default": "True",
+        "type": "bool"
+    },
+    "ALERT_SENSOR_STALE_SECONDS": {
+        "default": "300",
+        "type": "int",
+        "min": 10,
+        "max": 3600
+    },
+    "ALERT_RELAY_TIMEOUT_SECONDS": {
+        "default": "10",
+        "type": "int",
+        "min": 1,
+        "max": 300
+    },
+    "ALERT_TEMP_RISE_CHECK_SECONDS": {
+        "default": "900",
+        "type": "int",
+        "min": 60,
+        "max": 7200
+    },
+    "ALERT_TEMP_RISE_MIN_DELTA": {
+        "default": "0.3",
+        "type": "float",
+        "min": 0.1,
+        "max": 5.0
+    },
+    "ALERT_RESTART_STORM_COUNT": {
+        "default": "5",
+        "type": "int",
+        "min": 2,
+        "max": 50
+    },
+    "ALERT_RESTART_STORM_WINDOW": {
+        "default": "300",
+        "type": "int",
+        "min": 60,
+        "max": 86400
+    },
+    "PREDICTIVE_HEATING_ENABLED": {
+        "default": "True",
+        "type": "bool"
+    },
+    "PREDICTIVE_BASE_RATE": {
+        "default": "0.7",
+        "type": "float",
+        "min": 0.05,
+        "max": 3.0
+    },
+    "PREDICTIVE_MIN_LEARNING_SECONDS": {
+        "default": "600",
+        "type": "int",
+        "min": 60,
+        "max": 7200
+    },
+    "PREDICTIVE_MIN_RATE": {
+        "default": "0.15",
+        "type": "float",
+        "min": 0.01,
+        "max": 2.0
+    },
+    "PREDICTIVE_MAX_RATE": {
+        "default": "1.5",
+        "type": "float",
+        "min": 0.05,
+        "max": 5.0
+    },
 }
 
 def _table_exists(cur, name):
