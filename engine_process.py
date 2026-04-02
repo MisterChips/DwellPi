@@ -812,7 +812,7 @@ class EngineProcess(SettingsClient):
         except Exception:
             return
 
-        heating_active = bool(ch_calling_for_heat and relay_a_on)
+        heating_active = bool(ch_calling_for_heat and actual_ch_on)
 
         if not heating_active:
             self.last_heatup_temp = current_temp
@@ -889,7 +889,7 @@ class EngineProcess(SettingsClient):
         try:
             current_temp = float(current_temp)
             target_temp = float(target_temp)
-            heatup_rate = float(self.heatup_rate)
+            heatup_rate = float(self.fallback_heatup_rate)
         except Exception:
             return None
 
