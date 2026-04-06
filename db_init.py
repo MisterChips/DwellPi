@@ -549,6 +549,35 @@ def initialise_database(db_path):
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS heatup_learning_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_ts_epoch REAL,
+            ended_ts_epoch REAL,
+            duration_seconds REAL,
+            start_temp REAL,
+            end_temp REAL,
+            delta_temp REAL,
+            calculated_rate REAL,
+            target_temp REAL,
+            warmup_enabled INTEGER,
+            relay_confirmed_seconds REAL,
+            valid INTEGER,
+            invalid_reason TEXT,
+            created_ts_epoch REAL
+        )
+    """)
+
+    cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_heatup_learning_valid_warmup_end
+            ON heatup_learning_log(valid, warmup_enabled, ended_ts_epoch)
+        """)
+
+    cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_heatup_learning_created
+            ON heatup_learning_log(created_ts_epoch)
+        """)
+
 
     # ---- Validates and corrects settings ----
 
